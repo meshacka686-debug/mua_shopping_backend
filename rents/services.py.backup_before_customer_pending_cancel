@@ -1,0 +1,669 @@
+from decimal import Decimal
+
+from django.db import transaction
+from django.utils import timezone
+
+from payments.models import FinancialTransaction, Wallet
+
+from .models import Rent, RentBooking
+
+
+RENT_ADMIN_COMMISSION = Decimal("500.00")
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _get_locked_wallet(user):
+    """
+    Return the user's wallet with a database lock.
+    """
+
+    wallet, _ = Wallet.objects.get_or_create(
+        owner=user,
+    )
+
+    return (
+        Wallet.objects
+        .select_for_update()
+        .get(pk=wallet.pk)
+    )
+
+
+def _refund_customer_hold(booking):
+    """
+    Return the customer's held rental money to available balance.
+
+    This function must be called inside transaction.atomic().
+    """
+
+    customer_wallet = _get_locked_wallet(
+        booking.customer
+    )
+
+    amount = Decimal(booking.amount)
+
+    if customer_wallet.held_balance < amount:
+        raise ValueError(
+            "Customer held balance is insufficient "
+            "for this rental refund."
+        )
+
+    hold_reference = f"RENT-HOLD-{booking.id}"
+
+    hold_transaction = (
+        FinancialTransaction.objects
+        .select_for_update()
+        .filter(
+            reference=hold_reference,
+            transaction_type="purchase_hold",
+        )
+        .first()
+    )
+
+    if not hold_transaction:
+        raise ValueError(
+            "Rental wallet hold transaction was not found."
+        )
+
+    if hold_transaction.status == "reversed":
+        return
+
+    if hold_transaction.status != "completed":
+        raise ValueError(
+            "Rental wallet hold is not in a refundable state."
+        )
+
+    customer_wallet.held_balance -= amount
+    customer_wallet.available_balance += amount
+
+    customer_wallet.save(
+        update_fields=[
+            "held_balance",
+            "available_balance",
+            "updated_at",
+        ]
+    )
+
+    hold_transaction.status = "reversed"
+
+    hold_transaction.save(
+        update_fields=[
+            "status",
+            "updated_at",
+        ]
+    )
+
+    FinancialTransaction.objects.create(
+        user=booking.customer,
+        transaction_type="purchase_refund",
+        status="completed",
+        amount=amount,
+        reference=f"RENT-REFUND-{booking.id}",
+        description=(
+            f"Rental booking #{booking.id} funds returned "
+            f"to customer wallet."
+        ),
+    )
+
+
+def _decrease_rent_quantity(rent):
+    """
+    Consume one available rental unit.
+    """
+
+    if rent.quantity <= 0:
+        raise ValueError(
+            "This rental has no available quantity."
+        )
+
+    rent.quantity -= 1
+
+    rent.is_available = rent.quantity > 0
+
+    rent.save(
+        update_fields=[
+            "quantity",
+            "is_available",
+            "updated_at",
+        ]
+    )
+
+
+def _increase_rent_quantity(rent):
+    """
+    Restore one rental unit after rejection/cancellation.
+    """
+
+    rent.quantity += 1
+
+    rent.is_available = True
+
+    rent.save(
+        update_fields=[
+            "quantity",
+            "is_available",
+            "updated_at",
+        ]
+    )
+
+
+# ============================================================
+# CREATE BOOKING
+# ============================================================
+
+@transaction.atomic
+def create_rent_booking(*, rent_id, customer):
+    """
+    Customer books one available unit.
+
+    Customer:
+        available -> held
+
+    Rental:
+        quantity -= 1
+
+    Owner:
+        receives nothing yet.
+
+    Admin:
+        receives nothing yet.
+    """
+
+    rent = (
+        Rent.objects
+        .select_for_update()
+        .select_related("owner")
+        .get(pk=rent_id)
+    )
+
+    if not rent.is_available or rent.quantity <= 0:
+        raise ValueError(
+            "This rental is currently unavailable."
+        )
+
+    if rent.owner_id == customer.id:
+        raise ValueError(
+            "You cannot book your own rental."
+        )
+
+    if getattr(customer, "role", None) != "customer":
+        raise ValueError(
+            "Only customer accounts can book rentals."
+        )
+
+    amount = Decimal(rent.price)
+
+    if amount <= Decimal("0.00"):
+        raise ValueError(
+            "Rental price must be greater than zero."
+        )
+
+    if amount <= RENT_ADMIN_COMMISSION:
+        raise ValueError(
+            "Rental price must be greater than the "
+            "₦500 admin commission."
+        )
+
+    customer_wallet = _get_locked_wallet(customer)
+
+    if customer_wallet.available_balance < amount:
+        raise ValueError(
+            "Insufficient wallet balance."
+        )
+
+    booking = RentBooking.objects.create(
+        rent=rent,
+        customer=customer,
+        amount=amount,
+        status=RentBooking.STATUS_PENDING_OWNER,
+    )
+
+    customer_wallet.available_balance -= amount
+    customer_wallet.held_balance += amount
+
+    customer_wallet.save(
+        update_fields=[
+            "available_balance",
+            "held_balance",
+            "updated_at",
+        ]
+    )
+
+    FinancialTransaction.objects.create(
+        user=customer,
+        transaction_type="purchase_hold",
+        status="completed",
+        amount=amount,
+        reference=f"RENT-HOLD-{booking.id}",
+        description=(
+            f"Wallet funds held for rental "
+            f"booking #{booking.id}."
+        ),
+    )
+
+    _decrease_rent_quantity(rent)
+
+    return booking
+
+
+# ============================================================
+# OWNER CONFIRMS
+# ============================================================
+
+@transaction.atomic
+def confirm_rent_booking(*, booking_id, owner):
+    """
+    Owner confirms the booking.
+
+    No money moves here.
+
+    Customer money remains held until customer confirms.
+    """
+
+    booking = (
+        RentBooking.objects
+        .select_for_update()
+        .select_related("rent", "customer")
+        .get(pk=booking_id)
+    )
+
+    if booking.rent.owner_id != owner.id:
+        raise ValueError(
+            "You can only manage bookings for your own rentals."
+        )
+
+    if booking.status == RentBooking.STATUS_OWNER_CONFIRMED:
+        return booking
+
+    if booking.status != RentBooking.STATUS_PENDING_OWNER:
+        raise ValueError(
+            "This booking cannot be confirmed in its current state."
+        )
+
+    booking.status = RentBooking.STATUS_OWNER_CONFIRMED
+    booking.owner_confirmed_at = timezone.now()
+
+    booking.save(
+        update_fields=[
+            "status",
+            "owner_confirmed_at",
+            "updated_at",
+        ]
+    )
+
+    return booking
+
+
+# ============================================================
+# OWNER REJECTS
+# ============================================================
+
+@transaction.atomic
+def reject_rent_booking(*, booking_id, owner):
+    """
+    Owner rejects a booking while it is waiting for confirmation.
+
+    Customer:
+        held -> available
+
+    Rental:
+        quantity += 1
+    """
+
+    booking = (
+        RentBooking.objects
+        .select_for_update()
+        .select_related("rent", "customer")
+        .get(pk=booking_id)
+    )
+
+    if booking.rent.owner_id != owner.id:
+        raise ValueError(
+            "You can only manage bookings for your own rentals."
+        )
+
+    if booking.status == RentBooking.STATUS_OWNER_REJECTED:
+        return booking
+
+    if booking.status != RentBooking.STATUS_PENDING_OWNER:
+        raise ValueError(
+            "This booking cannot be rejected in its current state."
+        )
+
+    _refund_customer_hold(booking)
+
+    booking.status = RentBooking.STATUS_OWNER_REJECTED
+    booking.owner_rejected_at = timezone.now()
+
+    booking.save(
+        update_fields=[
+            "status",
+            "owner_rejected_at",
+            "updated_at",
+        ]
+    )
+
+    _increase_rent_quantity(booking.rent)
+
+    return booking
+
+
+# ============================================================
+# OWNER CANCELS AFTER CONFIRMATION
+# ============================================================
+
+@transaction.atomic
+def cancel_rent_booking_by_owner(*, booking_id, owner):
+    """
+    Owner cancels a booking after previously confirming it.
+
+    Customer:
+        held -> available
+
+    Rental:
+        quantity += 1
+
+    Owner:
+        receives nothing.
+
+    Admin:
+        receives nothing.
+    """
+
+    booking = (
+        RentBooking.objects
+        .select_for_update()
+        .select_related("rent", "customer")
+        .get(pk=booking_id)
+    )
+
+    if booking.rent.owner_id != owner.id:
+        raise ValueError(
+            "You can only manage bookings for your own rentals."
+        )
+
+    if booking.status == RentBooking.STATUS_OWNER_CANCELLED:
+        return booking
+
+    if booking.status != RentBooking.STATUS_OWNER_CONFIRMED:
+        raise ValueError(
+            "Only an owner-confirmed booking can be cancelled "
+            "by the owner."
+        )
+
+    _refund_customer_hold(booking)
+
+    booking.status = RentBooking.STATUS_OWNER_CANCELLED
+    booking.owner_cancelled_at = timezone.now()
+
+    booking.save(
+        update_fields=[
+            "status",
+            "owner_cancelled_at",
+            "updated_at",
+        ]
+    )
+
+    _increase_rent_quantity(booking.rent)
+
+    return booking
+
+
+# ============================================================
+# CUSTOMER FINAL CONFIRMATION
+# ============================================================
+
+@transaction.atomic
+def complete_rent_booking(*, booking_id, customer):
+    """
+    Customer gives the final confirmation.
+
+    Customer:
+        held -> released
+
+    Owner:
+        available += amount - ₦500
+
+    Admin:
+        available += ₦500
+
+    Rental quantity remains consumed.
+    """
+
+    booking = (
+        RentBooking.objects
+        .select_for_update()
+        .select_related(
+            "rent",
+            "rent__owner",
+            "customer",
+        )
+        .get(pk=booking_id)
+    )
+
+    if booking.customer_id != customer.id:
+        raise ValueError(
+            "You can only confirm your own rental bookings."
+        )
+
+    if booking.status == RentBooking.STATUS_COMPLETED:
+        return booking
+
+    if booking.status != RentBooking.STATUS_OWNER_CONFIRMED:
+        raise ValueError(
+            "The rental owner must confirm the booking first."
+        )
+
+    amount = Decimal(booking.amount)
+
+    if amount <= RENT_ADMIN_COMMISSION:
+        raise ValueError(
+            "Rental amount must be greater than "
+            "the admin commission."
+        )
+
+    owner = booking.rent.owner
+
+    customer_wallet = _get_locked_wallet(
+        booking.customer
+    )
+
+    owner_wallet = _get_locked_wallet(
+        owner
+    )
+
+    admin = (
+        owner.__class__.objects
+        .filter(
+            role="admin",
+            is_active=True,
+        )
+        .order_by("id")
+        .first()
+    )
+
+    if not admin:
+        raise ValueError(
+            "No active admin account is available "
+            "for rental commission."
+        )
+
+    admin_wallet = _get_locked_wallet(admin)
+
+    if customer_wallet.held_balance < amount:
+        raise ValueError(
+            "Customer held balance is insufficient "
+            "to complete this rental."
+        )
+
+    hold_reference = f"RENT-HOLD-{booking.id}"
+
+    hold_transaction = (
+        FinancialTransaction.objects
+        .select_for_update()
+        .filter(
+            reference=hold_reference,
+            transaction_type="purchase_hold",
+        )
+        .first()
+    )
+
+    if not hold_transaction:
+        raise ValueError(
+            "Rental wallet hold transaction was not found."
+        )
+
+    if hold_transaction.status != "completed":
+        raise ValueError(
+            "Rental wallet hold is not available for settlement."
+        )
+
+    owner_amount = amount - RENT_ADMIN_COMMISSION
+
+    customer_wallet.held_balance -= amount
+
+    owner_wallet.available_balance += owner_amount
+
+    admin_wallet.available_balance += RENT_ADMIN_COMMISSION
+
+    customer_wallet.save(
+        update_fields=[
+            "held_balance",
+            "updated_at",
+        ]
+    )
+
+    owner_wallet.save(
+        update_fields=[
+            "available_balance",
+            "updated_at",
+        ]
+    )
+
+    admin_wallet.save(
+        update_fields=[
+            "available_balance",
+            "updated_at",
+        ]
+    )
+
+    hold_transaction.status = "reversed"
+
+    hold_transaction.save(
+        update_fields=[
+            "status",
+            "updated_at",
+        ]
+    )
+
+    FinancialTransaction.objects.create(
+        user=owner,
+        transaction_type="sale_released",
+        status="completed",
+        amount=owner_amount,
+        reference=f"RENT-EARNING-{booking.id}",
+        description=(
+            f"Rental earnings released for "
+            f"booking #{booking.id}."
+        ),
+    )
+
+    FinancialTransaction.objects.create(
+        user=admin,
+        transaction_type="commission",
+        status="completed",
+        amount=RENT_ADMIN_COMMISSION,
+        reference=f"RENT-COMMISSION-{booking.id}",
+        description=(
+            f"Admin commission for rental "
+            f"booking #{booking.id}."
+        ),
+    )
+
+    FinancialTransaction.objects.create(
+        user=customer,
+        transaction_type="purchase_release",
+        status="completed",
+        amount=amount,
+        reference=f"RENT-RELEASE-{booking.id}",
+        description=(
+            f"Customer rental hold released after "
+            f"completion of booking #{booking.id}."
+        ),
+    )
+
+    booking.status = RentBooking.STATUS_COMPLETED
+    booking.completed_at = timezone.now()
+
+    booking.save(
+        update_fields=[
+            "status",
+            "completed_at",
+            "updated_at",
+        ]
+    )
+
+    return booking
+
+
+# ============================================================
+# CUSTOMER CANCELS AFTER OWNER CONFIRMATION
+# ============================================================
+
+@transaction.atomic
+def cancel_rent_booking(*, booking_id, customer):
+    """
+    Customer cancels after owner confirmation.
+
+    Customer:
+        held -> available
+
+    Rental:
+        quantity += 1
+
+    Owner:
+        receives nothing.
+
+    Admin:
+        receives nothing.
+    """
+
+    booking = (
+        RentBooking.objects
+        .select_for_update()
+        .select_related("rent", "customer")
+        .get(pk=booking_id)
+    )
+
+    if booking.customer_id != customer.id:
+        raise ValueError(
+            "You can only cancel your own rental bookings."
+        )
+
+    if booking.status == RentBooking.STATUS_CUSTOMER_CANCELLED:
+        return booking
+
+    if booking.status != RentBooking.STATUS_OWNER_CONFIRMED:
+        raise ValueError(
+            "This booking can only be cancelled after "
+            "the owner confirms it."
+        )
+
+    _refund_customer_hold(booking)
+
+    booking.status = RentBooking.STATUS_CUSTOMER_CANCELLED
+    booking.customer_cancelled_at = timezone.now()
+
+    booking.save(
+        update_fields=[
+            "status",
+            "customer_cancelled_at",
+            "updated_at",
+        ]
+    )
+
+    _increase_rent_quantity(booking.rent)
+
+    return booking

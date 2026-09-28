@@ -1,0 +1,288 @@
+from decimal import Decimal
+
+from django.conf import settings
+from django.db import models
+
+from products.product_options import ProductImage
+
+from products.product_options import ProductImage
+
+from products.models import Product
+from products.customer_models import CustomerProduct
+
+
+class Order(models.Model):
+
+    # ============================================================
+    # PAYMENT METHODS
+    # ============================================================
+
+    PAYMENT_METHODS = [
+        # Current checkout methods
+        ("wallet", "Wallet"),
+        ("paystack", "Paystack"),
+
+        # Kept for compatibility with existing orders
+        ("cash", "Cash on Delivery"),
+        ("bank", "Bank Transfer"),
+    ]
+
+    PAYMENT_CHANNEL_CHOICES = [
+        ("card", "Card"),
+        ("ussd", "USSD"),
+    ]
+
+    PAYMENT_STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("paid", "Paid"),
+        ("failed", "Failed"),
+    ]
+
+    # ============================================================
+    # SHOP ORDER STATUS
+    # ============================================================
+
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("confirmed", "Confirmed"),
+        ("processing", "Processing"),
+        ("shipped", "Shipped"),
+        ("delivered", "Delivered"),
+        ("cancelled", "Cancelled"),
+    ]
+
+    # ============================================================
+    # CUSTOMER DELIVERY RESPONSE
+    # ============================================================
+
+    DELIVERY_STATUS_CHOICES = [
+        ("waiting", "Waiting"),
+        ("received", "Received"),
+        ("rejected", "Rejected"),
+    ]
+
+    # ============================================================
+    # CUSTOMER
+    # ============================================================
+
+    customer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="orders",
+    )
+
+    # ============================================================
+    # DELIVERY INFORMATION
+    # ============================================================
+
+    full_name = models.CharField(
+        max_length=150,
+    )
+
+    phone = models.CharField(
+        max_length=30,
+    )
+
+    address = models.TextField()
+
+    city = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+    )
+
+    state = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+    )
+
+    # ============================================================
+    # PAYMENT
+    # ============================================================
+
+    payment_method = models.CharField(
+        max_length=20,
+        choices=PAYMENT_METHODS,
+    )
+
+    payment_channel = models.CharField(
+        max_length=20,
+        choices=PAYMENT_CHANNEL_CHOICES,
+        blank=True,
+        default="",
+    )
+
+    payment_status = models.CharField(
+        max_length=20,
+        choices=PAYMENT_STATUS_CHOICES,
+        default="pending",
+    )
+
+    payment_reference = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        unique=True,
+    )
+
+    paid_at = models.DateTimeField(
+        blank=True,
+        null=True,
+    )
+
+    # ============================================================
+    # SHOP ORDER STATUS
+    # ============================================================
+
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="pending",
+    )
+
+    # ============================================================
+    # CUSTOMER DELIVERY STATUS
+    # ============================================================
+
+    delivery_status = models.CharField(
+        max_length=20,
+        choices=DELIVERY_STATUS_CHOICES,
+        default="waiting",
+    )
+    stock_restored = models.BooleanField(default=False)
+    # ============================================================
+    # ORDER TOTAL
+    # ============================================================
+
+    delivery_fee = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+
+    total_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+    )
+
+    # ============================================================
+    # DATES
+    # ============================================================
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True,
+    )
+
+    # ============================================================
+    # DISPLAY
+    # ============================================================
+
+    def __str__(self):
+        return f"Order #{self.id} - {self.full_name}"
+
+
+class OrderItem(models.Model):
+
+    # ============================================================
+    # ORDER
+    # ============================================================
+
+    order = models.ForeignKey(
+        Order,
+        on_delete=models.CASCADE,
+        related_name="items",
+    )
+
+    # ============================================================
+    # PRODUCT
+    # ============================================================
+
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="order_items",
+    )
+
+    customer_product = models.ForeignKey(
+        CustomerProduct,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="customer_order_items",
+    )
+
+    # ============================================================
+    # SELECTED PRODUCT PICTURE
+    # ============================================================
+
+    product_image = models.ForeignKey(
+        ProductImage,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="order_items",
+    )
+
+    # Size is stored as a snapshot so the order still
+    # remembers what the customer selected.
+    size = models.CharField(
+        max_length=100,
+        blank=True,
+    )
+
+    # ============================================================
+    # SELECTED PRODUCT PICTURE
+    # ============================================================
+
+    product_image = models.ForeignKey(
+        ProductImage,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="order_items",
+    )
+
+    # Size is stored as a snapshot so the order still
+    # remembers what the customer selected.
+    size = models.CharField(
+        max_length=100,
+        blank=True,
+    )
+
+    # ============================================================
+    # QUANTITY
+    # ============================================================
+
+    quantity = models.PositiveIntegerField()
+
+    # ============================================================
+    # PRICE AT TIME OF ORDER
+    # ============================================================
+
+    price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+    )
+
+    # ============================================================
+    # TOTAL PRICE
+    # ============================================================
+
+    @property
+    def total_price(self):
+        return self.price * self.quantity
+
+    # ============================================================
+    # DISPLAY
+    # ============================================================
+
+    def __str__(self):
+        product_name = self.product.name if self.product else "Deleted product"
+        return f"{product_name} x {self.quantity}"

@@ -1,0 +1,66 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Django
+*.log
+staticfiles/
+static/
+media/
+
+# SQLite / local databases
+db.sqlite3
+*.sqlite3
+*.sqlite3-journal
+
+# Database backups
+db_backup_*.sqlite3
+*.sqlite3.backup
+
+# Uploaded/private credentials
+firebase-service-account*.json
+firebase-adminsdk*.json
+service-account*.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives
+*.tar
+*.tar.gz
+*.zip
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# Coverage / testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Local inspection / backup files
+.safe_*/
+notification_full_inspection.txt
+
+# Unused temporary Django app
+accounts_password_reset_tmp/

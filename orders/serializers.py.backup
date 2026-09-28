@@ -1,0 +1,298 @@
+from django.db import transaction
+from rest_framework import serializers
+
+from products.models import Product
+from .models import Order, OrderItem
+
+
+class OrderItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(
+        source="product.name",
+        read_only=True,
+    )
+
+    product_image = serializers.ImageField(
+        source="product.image",
+        read_only=True,
+    )
+
+    total_price = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OrderItem
+        fields = [
+            "id",
+            "product",
+            "product_name",
+            "product_image",
+            "quantity",
+            "price",
+            "total_price",
+        ]
+
+        read_only_fields = [
+            "id",
+            "product_name",
+            "product_image",
+            "price",
+            "total_price",
+        ]
+
+    def get_total_price(self, obj):
+        return obj.total_price
+
+
+class OrderSerializer(serializers.ModelSerializer):
+    items = OrderItemSerializer(
+        many=True,
+        write_only=True,
+    )
+
+    order_items = OrderItemSerializer(
+        source="items",
+        many=True,
+        read_only=True,
+    )
+
+    class Meta:
+        model = Order
+
+        fields = [
+            "id",
+            "customer",
+            "full_name",
+            "phone",
+            "address",
+            "city",
+            "state",
+            "payment_method",
+            "payment_channel",
+            "payment_status",
+            "payment_reference",
+            "paid_at",
+            "status",
+            "delivery_status",
+            "total_amount",
+            "items",
+            "delivery_fee",
+            "order_items",
+            "created_at",
+            "updated_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "customer",
+            "status",
+            "delivery_status",
+            "payment_status",
+            "payment_reference",
+            "paid_at",
+            "total_amount",
+            "delivery_fee",
+            "order_items",
+            "created_at",
+            "updated_at",
+        ]
+
+    def validate_payment_method(self, value):
+        valid_methods = {
+            "wallet",
+            "paystack",
+            "cash",
+            "bank",
+        }
+
+        if value not in valid_methods:
+            raise serializers.ValidationError(
+                "Invalid payment method."
+            )
+
+        return value
+
+    def validate(self, attrs):
+        payment_method = attrs.get("payment_method")
+        payment_channel = attrs.get("payment_channel", "")
+
+        if payment_method == "paystack":
+            if payment_channel not in {"card", "ussd"}:
+                raise serializers.ValidationError({
+                    "payment_channel": (
+                        "Card or USSD must be selected "
+                        "for Paystack payment."
+                    )
+                })
+
+        elif payment_method == "wallet":
+            if payment_channel:
+                attrs["payment_channel"] = ""
+
+        return attrs
+
+    def validate_items(self, items):
+        if not items:
+            raise serializers.ValidationError(
+                "Your order must contain at least one product."
+            )
+
+        product_ids = []
+
+        for item in items:
+            product = item["product"]
+            quantity = item["quantity"]
+
+            if quantity < 1:
+                raise serializers.ValidationError(
+                    "Quantity must be at least 1."
+                )
+
+            if product.id in product_ids:
+                raise serializers.ValidationError(
+                    f"{product.name} appears more than once "
+                    "in this order."
+                )
+
+            product_ids.append(product.id)
+
+            if not product.is_available:
+                raise serializers.ValidationError(
+                    f"{product.name} is currently unavailable."
+                )
+
+            if not product.shop.is_active:
+                raise serializers.ValidationError(
+                    f"{product.name}'s shop is currently inactive."
+                )
+
+            if product.quantity < quantity:
+                raise serializers.ValidationError(
+                    f"Only {product.quantity} of "
+                    f"{product.name} is available."
+                )
+
+        return items
+
+    @transaction.atomic
+    def create(self, validated_data):
+        items_data = validated_data.pop("items")
+
+        product_ids = [
+            item["product"].id
+            for item in items_data
+        ]
+
+        locked_products = (
+            Product.objects
+            .select_for_update()
+            .select_related("shop")
+            .filter(id__in=product_ids)
+        )
+
+        products = {
+            product.id: product
+            for product in locked_products
+        }
+
+        if len(products) != len(product_ids):
+            raise serializers.ValidationError(
+                "One or more selected products were not found."
+            )
+
+        total = 0
+
+        for item_data in items_data:
+            product_id = item_data["product"].id
+            quantity = item_data["quantity"]
+
+            product = products[product_id]
+
+            if not product.is_available:
+                raise serializers.ValidationError(
+                    f"{product.name} is currently unavailable."
+                )
+
+            if not product.shop.is_active:
+                raise serializers.ValidationError(
+                    f"{product.name}'s shop is currently inactive."
+                )
+
+            if product.quantity < quantity:
+                raise serializers.ValidationError(
+                    f"Only {product.quantity} of "
+                    f"{product.name} is available."
+                )
+
+            total += product.price * quantity
+
+        order = Order.objects.create(
+            customer=self.context["request"].user,
+            total_amount=total,
+            **validated_data,
+        )
+
+        for item_data in items_data:
+            product_id = item_data["product"].id
+            quantity = item_data["quantity"]
+
+            product = products[product_id]
+
+            OrderItem.objects.create(
+                order=order,
+                product=product,
+                quantity=quantity,
+                price=product.price,
+            )
+
+            product.quantity -= quantity
+            product.is_available = product.quantity > 0
+
+            product.save(
+                update_fields=[
+                    "quantity",
+                    "is_available",
+                    "updated_at",
+                ]
+            )
+
+        return order
+class ShopOrderStatusSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Order
+        fields = ["status"]
+
+    def validate_status(self, value):
+        valid_statuses = {
+            "pending",
+            "confirmed",
+            "processing",
+            "shipped",
+            "delivered",
+            "cancelled",
+        }
+
+        if value not in valid_statuses:
+            raise serializers.ValidationError(
+                "Invalid order status."
+            )
+
+        return value
+
+
+class CustomerDeliveryStatusSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Order
+        fields = ["delivery_status"]
+
+    def validate_delivery_status(self, value):
+        valid_statuses = {
+            "waiting",
+            "received",
+            "rejected",
+        }
+
+        if value not in valid_statuses:
+            raise serializers.ValidationError(
+                "Invalid delivery status."
+            )
+
+        return value    

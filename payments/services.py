@@ -1,0 +1,3911 @@
+import os
+import uuid
+from decimal import Decimal
+
+import requests
+
+from django.db import transaction
+from django.utils import timezone
+
+from orders.models import Order
+from accounts.models import User
+
+from .models import (
+    AdminCommission,
+    BankAccount,
+    FinancialTransaction,
+    RefundRequest,
+    WalletDeposit,
+    Wallet,
+    WithdrawalRequest,
+)
+
+
+COMMISSION_PER_UNIT = Decimal("500.00")
+
+
+# =========================================================
+# BANK ACCOUNT VERIFICATION
+# =========================================================
+
+def verify_bank_account(bank_code, account_number):
+    """
+    Verify a Nigerian bank account using Paystack.
+    """
+
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY")
+
+    if not secret_key:
+        raise ValueError(
+            "Paystack secret key is not configured on the server."
+        )
+
+    bank_code = str(bank_code).strip()
+    account_number = str(account_number).strip()
+
+    if not bank_code:
+        raise ValueError("Bank code is required.")
+
+    if not account_number.isdigit():
+        raise ValueError(
+            "Account number must contain numbers only."
+        )
+
+    if len(account_number) != 10:
+        raise ValueError(
+            "Nigerian account number must be 10 digits."
+        )
+
+    try:
+        response = requests.get(
+            "https://api.paystack.co/bank/resolve",
+            headers={
+                "Authorization": f"Bearer {secret_key}",
+                "Content-Type": "application/json",
+            },
+            params={
+                "account_number": account_number,
+                "bank_code": bank_code,
+            },
+            timeout=15,
+        )
+    except requests.RequestException:
+        raise ValueError(
+            "Unable to connect to Paystack. Please try again."
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            "Paystack returned an invalid response."
+        )
+
+    if response.status_code != 200 or not data.get("status"):
+        raise ValueError(
+            data.get(
+                "message",
+                "Bank account could not be verified.",
+            )
+        )
+
+    account_data = data.get("data") or {}
+
+    resolved_account_number = account_data.get(
+        "account_number"
+    )
+
+    account_name = account_data.get("account_name")
+
+    if not resolved_account_number:
+        raise ValueError(
+            "Paystack could not resolve the account number."
+        )
+
+    if not account_name:
+        raise ValueError(
+            "Paystack could not resolve the account name."
+        )
+
+    return {
+        "account_number": resolved_account_number,
+        "account_name": account_name,
+        "bank_code": bank_code,
+    }
+
+
+# =========================================================
+# PAYSTACK HEADERS
+# =========================================================
+
+def _paystack_headers():
+    """
+    Return headers required for Paystack API requests.
+    """
+
+    secret_key = os.getenv("PAYSTACK_SECRET_KEY")
+
+    if not secret_key:
+        raise ValueError(
+            "Paystack secret key is not configured on the server."
+        )
+
+    return {
+        "Authorization": f"Bearer {secret_key}",
+        "Content-Type": "application/json",
+    }
+
+
+
+# =========================================================
+# PAYSTACK ORDER PAYMENT
+# =========================================================
+
+def initialize_paystack_payment(order):
+    """
+    Initialize a Paystack payment for an order.
+    """
+
+    order = (
+        Order.objects
+        .select_related("customer")
+        .get(pk=order.pk)
+    )
+
+    if order.payment_method != "paystack":
+        raise ValueError(
+            "This order is not configured for Paystack payment."
+        )
+
+    if order.payment_status == "paid":
+        raise ValueError(
+            "This order has already been paid."
+        )
+
+    if order.payment_status != "pending":
+        raise ValueError(
+            "This order cannot be paid because its payment "
+            "status is not pending."
+        )
+
+    if order.status == "cancelled":
+        raise ValueError(
+            "Cancelled orders cannot be paid."
+        )
+
+    email = (
+        (order.customer.email or "").strip()
+    )
+
+    if not email:
+        raise ValueError(
+            "Your account must have an email address "
+            "before making a Paystack payment."
+        )
+
+    if order.payment_reference:
+        raise ValueError(
+            "A Paystack payment has already been initialized "
+            "for this order."
+        )
+
+    amount_kobo = int(
+        order.total_amount * Decimal("100")
+    )
+
+    if amount_kobo <= 0:
+        raise ValueError(
+            "Order amount must be greater than zero."
+        )
+
+    headers = _paystack_headers()
+
+    payload = {
+        "email": email,
+        "amount": amount_kobo,
+        "channels": [order.payment_channel],
+        "metadata": {
+            "order_id": order.id,
+            "customer_id": order.customer_id,
+        },
+    }
+
+    callback_url = os.getenv(
+        "PAYSTACK_CALLBACK_URL"
+    )
+
+    if callback_url:
+        payload["callback_url"] = callback_url
+
+    response = requests.post(
+        "https://api.paystack.co/transaction/initialize",
+        headers=headers,
+        json=payload,
+        timeout=20,
+    )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            "Paystack returned an invalid response."
+        )
+
+    if not response.ok or not data.get("status"):
+        raise ValueError(
+            data.get(
+                "message",
+                "Unable to initialize Paystack payment.",
+            )
+        )
+
+    payment_data = data.get("data") or {}
+
+    reference = payment_data.get("reference")
+    authorization_url = payment_data.get(
+        "authorization_url"
+    )
+    access_code = payment_data.get("access_code")
+
+    if not reference or not authorization_url:
+        raise ValueError(
+            "Paystack did not return a valid payment URL."
+        )
+
+    order.payment_reference = reference
+
+    order.save(
+        update_fields=[
+            "payment_reference",
+            "updated_at",
+        ]
+    )
+
+    return {
+        "reference": reference,
+        "authorization_url": authorization_url,
+        "access_code": access_code,
+    }
+
+
+@transaction.atomic
+def verify_paystack_payment(order):
+    """
+    Verify an existing Paystack payment.
+    """
+
+    order = (
+        Order.objects
+        .select_for_update()
+        .select_related("customer")
+        .get(pk=order.pk)
+    )
+
+    if order.payment_method != "paystack":
+        raise ValueError(
+            "This order is not configured for Paystack payment."
+        )
+
+    if order.payment_status == "paid":
+        return {
+            "status": "paid",
+            "reference": order.payment_reference,
+            "order_id": order.id,
+        }
+
+    reference = (
+        (order.payment_reference or "").strip()
+    )
+
+    if not reference:
+        raise ValueError(
+            "This order does not have a Paystack payment reference."
+        )
+
+    headers = _paystack_headers()
+
+    try:
+        response = requests.get(
+            "https://api.paystack.co/"
+            f"transaction/verify/{reference}",
+            headers=headers,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        raise ValueError(
+            f"Unable to connect to Paystack: {exc}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            "Paystack returned an invalid response."
+        )
+
+    if not response.ok or not data.get("status"):
+        raise ValueError(
+            data.get(
+                "message",
+                "Paystack payment verification failed.",
+            )
+        )
+
+    payment_data = data.get("data") or {}
+
+    paystack_status = (
+        payment_data.get("status") or ""
+    ).lower()
+
+    paystack_reference = (
+        payment_data.get("reference") or ""
+    )
+
+    if paystack_reference != reference:
+        raise ValueError(
+            "Paystack payment reference does not match "
+            "the order payment reference."
+        )
+
+    expected_amount = int(
+        order.total_amount * Decimal("100")
+    )
+
+    actual_amount = payment_data.get("amount")
+
+    if actual_amount != expected_amount:
+        raise ValueError(
+            "The Paystack payment amount does not match "
+            "the order amount."
+        )
+
+    if paystack_status == "success":
+
+        order.payment_status = "paid"
+        order.paid_at = timezone.now()
+
+        order.save(
+            update_fields=[
+                "payment_status",
+                "paid_at",
+                "updated_at",
+            ]
+        )
+
+        create_sale_financial_records(order)
+
+        return {
+            "status": "paid",
+            "reference": reference,
+            "order_id": order.id,
+        }
+
+    if paystack_status in {
+        "failed",
+        "abandoned",
+        "reversed",
+    }:
+
+        order.payment_status = "failed"
+
+        order.save(
+            update_fields=[
+                "payment_status",
+                "updated_at",
+            ]
+        )
+
+        restore_order_stock(order)
+
+        return {
+            "status": "failed",
+            "reference": reference,
+            "order_id": order.id,
+        }
+
+    return {
+        "status": "pending",
+        "paystack_status": paystack_status,
+        "reference": reference,
+        "order_id": order.id,
+    }
+
+
+# =========================================================
+# ORDER SALE FINANCIAL RECORDS
+# =========================================================
+
+@transaction.atomic
+def create_sale_financial_records(order):
+    """
+    Create pending seller earnings when an order becomes paid.
+
+    Supports both:
+        Shop product:
+            Product -> Shop -> owner
+
+        Customer product:
+            CustomerProduct -> seller
+
+    The seller receives the FULL product sale amount in pending_balance.
+    Commission is NOT taken here.
+
+    Commission is created only when the customer confirms delivery.
+    """
+
+    for item in order.items.select_related(
+        "product__shop__owner",
+        "customer_product__seller",
+    ).all():
+
+        if item.product_id:
+            seller = item.product.shop.owner
+            product_name = item.product.name
+
+        elif item.customer_product_id:
+            seller = item.customer_product.seller
+            product_name = item.customer_product.name
+
+        else:
+            raise ValueError(
+                f"Order item {item.id} has no product."
+            )
+
+        sale_amount = Decimal(item.price) * item.quantity
+
+        wallet, _ = Wallet.objects.get_or_create(
+            owner=seller
+        )
+
+        sale_reference = f"SALE-{order.id}-{item.id}"
+
+        sale_transaction, sale_created = (
+            FinancialTransaction.objects.get_or_create(
+                reference=sale_reference,
+                defaults={
+                    "user": seller,
+                    "transaction_type": "sale_pending",
+                    "status": "pending",
+                    "amount": sale_amount,
+                    "description": (
+                        f"Pending earnings from "
+                        f"{product_name}"
+                    ),
+                    "order": order,
+                },
+            )
+        )
+
+        if sale_created:
+            wallet.pending_balance += sale_amount
+
+            wallet.save(
+                update_fields=[
+                    "pending_balance",
+                    "updated_at",
+                ]
+            )
+
+
+# =========================================================
+# CUSTOMER WALLET ORDER PAYMENT
+# =========================================================
+
+@transaction.atomic
+def pay_order_with_wallet(order):
+    """
+    Pay for an existing order using the customer's wallet.
+
+    Customer money:
+        available_balance -> held_balance
+
+    Seller money:
+        full product sale amount -> pending_balance
+
+    Commission:
+        NOT created until customer confirms receipt.
+    """
+
+    order = (
+        Order.objects
+        .select_for_update()
+        .select_related("customer")
+        .get(pk=order.pk)
+    )
+
+    if order.payment_method != "wallet":
+        raise ValueError(
+            "This order is not configured for wallet payment."
+        )
+
+    if order.payment_status == "paid":
+        return {
+            "status": "paid",
+            "order_id": order.id,
+        }
+
+    if order.payment_status != "pending":
+        raise ValueError(
+            "This order cannot be paid because its payment "
+            "status is not pending."
+        )
+
+    if order.status == "cancelled":
+        raise ValueError(
+            "Cancelled orders cannot be paid."
+        )
+
+    amount = Decimal(order.total_amount)
+
+    if amount <= Decimal("0.00"):
+        raise ValueError(
+            "Order amount must be greater than zero."
+        )
+
+    wallet = (
+        Wallet.objects
+        .select_for_update()
+        .get_or_create(owner=order.customer)
+    )[0]
+
+    if wallet.available_balance < amount:
+        raise ValueError(
+            "Insufficient wallet balance."
+        )
+
+    hold_reference = f"PURCHASE-HOLD-{order.id}"
+
+    existing_hold = (
+        FinancialTransaction.objects
+        .filter(reference=hold_reference)
+        .first()
+    )
+
+    if existing_hold:
+        if existing_hold.status == "completed":
+            order.payment_status = "paid"
+            order.paid_at = timezone.now()
+            order.save(
+                update_fields=[
+                    "payment_status",
+                    "paid_at",
+                    "updated_at",
+                ]
+            )
+
+            create_sale_financial_records(order)
+
+            return {
+                "status": "paid",
+                "order_id": order.id,
+            }
+
+        raise ValueError(
+            "A wallet payment already exists for this order."
+        )
+
+    wallet.available_balance -= amount
+    wallet.held_balance += amount
+
+    wallet.save(
+        update_fields=[
+            "available_balance",
+            "held_balance",
+            "updated_at",
+        ]
+    )
+
+    FinancialTransaction.objects.create(
+        user=order.customer,
+        transaction_type="purchase_hold",
+        status="completed",
+        amount=amount,
+        reference=hold_reference,
+        description=(
+            f"Wallet funds held for order #{order.id}"
+        ),
+        order=order,
+    )
+
+    order.payment_status = "paid"
+    order.paid_at = timezone.now()
+
+    order.save(
+        update_fields=[
+            "payment_status",
+            "paid_at",
+            "updated_at",
+        ]
+    )
+
+    create_sale_financial_records(order)
+
+    return {
+        "status": "paid",
+        "order_id": order.id,
+        "amount": str(amount),
+    }
+
+
+# =========================================================
+# CANCEL ORDER / RETURN CUSTOMER HELD WALLET MONEY
+# =========================================================
+
+def cancel_customer_order(order):
+    """
+    Cancel an unpaid or wallet-paid order.
+
+    For wallet-paid orders, a ₦1,500 reversal fee is charged:
+
+        ₦1,000 -> seller/shop side
+        ₦500   -> admin
+
+    The customer receives:
+        original held amount - ₦1,500
+
+    Seller pending earnings are reversed.
+    Product stock is restored.
+
+    Paystack-paid orders cannot be cancelled here because their
+    external refund must be processed through Paystack.
+    """
+
+    REVERSAL_FEE = Decimal("1500.00")
+    SHOP_SHARE = Decimal("1000.00")
+    ADMIN_SHARE = Decimal("500.00")
+
+    order = (
+        Order.objects
+        .select_for_update()
+        .select_related("customer")
+        .get(pk=order.pk)
+    )
+
+    if order.delivery_status == "received":
+        raise ValueError(
+            "This order has already been received and paid to the seller."
+        )
+
+    if order.status == "cancelled":
+        return {
+            "status": "cancelled",
+            "order_id": order.id,
+        }
+
+    # Determine whether this is a Customer Product order.
+    # Customer Product cancellation has NO reversal fee.
+    is_customer_product_order = order.items.filter(
+        customer_product__isnull=False
+    ).exists()
+
+    # ---------------------------------------------------------
+    # Customer Product + Paystack
+    #
+    # Customer Product cancellation has NO reversal fee.
+    # The original Paystack payment is NOT refunded externally.
+    # Instead, the full amount is credited to the customer's
+    # MUA Wallet.
+    # ---------------------------------------------------------
+    if (
+        is_customer_product_order
+        and order.payment_method == "paystack"
+        and order.payment_status == "paid"
+    ):
+        refund_amount = Decimal(order.total_amount)
+        reversal_fee = Decimal("0.00")
+
+        if refund_amount <= Decimal("0.00"):
+            raise ValueError(
+                "The order amount must be greater than zero."
+            )
+
+        # -----------------------------------------------------
+        # Find pending seller earnings created when the
+        # Paystack payment was verified.
+        # -----------------------------------------------------
+        sale_transactions = list(
+            FinancialTransaction.objects
+            .select_for_update()
+            .filter(
+                order=order,
+                transaction_type="sale_pending",
+                status="pending",
+            )
+            .order_by("id")
+        )
+
+        if not sale_transactions:
+            raise ValueError(
+                "No pending seller earnings were found for this order."
+            )
+
+        # -----------------------------------------------------
+        # Customer receives the FULL Paystack-paid amount
+        # directly into the MUA Wallet.
+        # -----------------------------------------------------
+        customer_wallet = (
+            Wallet.objects
+            .select_for_update()
+            .get(owner=order.customer)
+        )
+
+        customer_wallet.available_balance += refund_amount
+
+        customer_wallet.save(
+            update_fields=[
+                "available_balance",
+                "updated_at",
+            ]
+        )
+
+        # -----------------------------------------------------
+        # Create the internal wallet refund transaction.
+        # This is the customer's refund inside MUA Wallet.
+        # -----------------------------------------------------
+        FinancialTransaction.objects.get_or_create(
+            reference=f"PURCHASE-REFUND-{order.id}",
+            defaults={
+                "user": order.customer,
+                "transaction_type": "purchase_refund",
+                "status": "completed",
+                "amount": refund_amount,
+                "description": (
+                    f"Full wallet refund after cancellation of "
+                    f"Customer Product Paystack order #{order.id}."
+                ),
+                "order": order,
+            },
+        )
+
+        # -----------------------------------------------------
+        # Reverse seller pending earnings.
+        # -----------------------------------------------------
+        for sale_transaction in sale_transactions:
+            seller_wallet = (
+                Wallet.objects
+                .select_for_update()
+                .get(owner_id=sale_transaction.user_id)
+            )
+
+            amount = Decimal(sale_transaction.amount)
+
+            seller_wallet.pending_balance -= amount
+
+            if seller_wallet.pending_balance < Decimal("0.00"):
+                seller_wallet.pending_balance = Decimal("0.00")
+
+            seller_wallet.save(
+                update_fields=[
+                    "pending_balance",
+                    "updated_at",
+                ]
+            )
+
+            sale_transaction.status = "reversed"
+
+            sale_transaction.save(
+                update_fields=[
+                    "status",
+                    "updated_at",
+                ]
+            )
+
+        # -----------------------------------------------------
+        # Cancel the order and restore Customer Product stock.
+        # -----------------------------------------------------
+        order.status = "cancelled"
+
+        order.save(
+            update_fields=[
+                "status",
+                "updated_at",
+            ]
+        )
+
+        restore_order_stock(order)
+
+        return {
+            "status": "cancelled",
+            "order_id": order.id,
+            "refund_amount": str(refund_amount),
+            "reversal_fee": "0.00",
+            "payment_method": "paystack",
+            "payment_status": "paid",
+            "refund_method": "mua_wallet",
+        }
+
+    # Shop Product + Paystack cancellation.
+    #
+    # Customer-initiated cancellation:
+    #   - Paystack payment is already completed.
+    #   - No wallet hold exists, so do NOT touch held_balance.
+    #   - Refund is credited to the customer's MUA Wallet.
+    #   - The normal Shop Product ₦1,500 reversal fee applies.
+    #   - Seller pending earnings are reversed.
+    #   - Stock is restored.
+    if (
+        not is_customer_product_order
+        and order.payment_method == "paystack"
+        and order.payment_status == "paid"
+    ):
+        refund_amount = Decimal(order.total_amount)
+        reversal_fee = REVERSAL_FEE
+
+        if refund_amount <= Decimal("0.00"):
+            raise ValueError(
+                "The order amount must be greater than zero."
+            )
+
+        if refund_amount <= reversal_fee:
+            raise ValueError(
+                "The order amount is too small to cover the "
+                "₦1,500 reversal fee."
+            )
+
+        # -----------------------------------------------------
+        # Find pending seller earnings created when the
+        # Paystack payment was verified.
+        # -----------------------------------------------------
+        sale_transactions = list(
+            FinancialTransaction.objects
+            .select_for_update()
+            .filter(
+                order=order,
+                transaction_type="sale_pending",
+                status="pending",
+            )
+            .order_by("id")
+        )
+
+        if not sale_transactions:
+            raise ValueError(
+                "No pending seller earnings were found for this order."
+            )
+
+        total_sales = sum(
+            (Decimal(tx.amount) for tx in sale_transactions),
+            Decimal("0.00"),
+        )
+
+        if total_sales <= Decimal("0.00"):
+            raise ValueError(
+                "The order has no valid seller earnings."
+            )
+
+        # -----------------------------------------------------
+        # Admin wallet for the ₦500 reversal-fee share.
+        # -----------------------------------------------------
+        admin = (
+            User.objects
+            .filter(
+                role="admin",
+                is_active=True,
+            )
+            .order_by("id")
+            .first()
+        )
+
+        if not admin:
+            raise ValueError(
+                "No active admin account is available for the "
+                "reversal fee."
+            )
+
+        admin_wallet, _ = Wallet.objects.get_or_create(
+            owner=admin
+        )
+
+        admin_wallet = (
+            Wallet.objects
+            .select_for_update()
+            .get(pk=admin_wallet.pk)
+        )
+
+        # -----------------------------------------------------
+        # Customer receives the Paystack refund minus the
+        # ₦1,500 reversal fee.
+        #
+        # Paystack does NOT create a wallet hold, so only
+        # available_balance is changed.
+        # -----------------------------------------------------
+        customer_wallet = (
+            Wallet.objects
+            .select_for_update()
+            .get(owner=order.customer)
+        )
+
+        customer_wallet.available_balance += refund_amount - reversal_fee
+
+        customer_wallet.save(
+            update_fields=[
+                "available_balance",
+                "updated_at",
+            ]
+        )
+
+        FinancialTransaction.objects.get_or_create(
+            reference=f"PURCHASE-REFUND-{order.id}",
+            defaults={
+                "user": order.customer,
+                "transaction_type": "purchase_refund",
+                "status": "completed",
+                "amount": refund_amount - reversal_fee,
+                "description": (
+                    f"Wallet refund after cancellation of "
+                    f"Paystack Shop Product order #{order.id}. "
+                    f"₦1,500 reversal fee deducted."
+                ),
+                "order": order,
+            },
+        )
+
+        # -----------------------------------------------------
+        # Reverse seller pending earnings.
+        # -----------------------------------------------------
+        seller_amounts = {}
+
+        for sale_transaction in sale_transactions:
+            seller_id = sale_transaction.user_id
+
+            seller_amounts.setdefault(
+                seller_id,
+                Decimal("0.00"),
+            )
+
+            seller_amounts[seller_id] += Decimal(
+                sale_transaction.amount
+            )
+
+            seller_wallet = (
+                Wallet.objects
+                .select_for_update()
+                .get(owner_id=seller_id)
+            )
+
+            amount = Decimal(sale_transaction.amount)
+
+            seller_wallet.pending_balance -= amount
+
+            if seller_wallet.pending_balance < Decimal("0.00"):
+                seller_wallet.pending_balance = Decimal("0.00")
+
+            seller_wallet.save(
+                update_fields=[
+                    "pending_balance",
+                    "updated_at",
+                ]
+            )
+
+            sale_transaction.status = "reversed"
+
+            sale_transaction.save(
+                update_fields=[
+                    "status",
+                    "updated_at",
+                ]
+            )
+
+        # -----------------------------------------------------
+        # ₦1,000 seller/shop share of reversal fee.
+        # -----------------------------------------------------
+        remaining_shop_share = SHOP_SHARE
+        seller_ids = list(seller_amounts.keys())
+
+        for index, seller_id in enumerate(seller_ids):
+
+            seller_amount = seller_amounts[seller_id]
+
+            if index == len(seller_ids) - 1:
+                seller_share = remaining_shop_share
+            else:
+                seller_share = (
+                    SHOP_SHARE
+                    * seller_amount
+                    / total_sales
+                ).quantize(Decimal("0.01"))
+
+                if seller_share > remaining_shop_share:
+                    seller_share = remaining_shop_share
+
+            remaining_shop_share -= seller_share
+
+            seller_wallet = (
+                Wallet.objects
+                .select_for_update()
+                .get(owner_id=seller_id)
+            )
+
+            seller_wallet.available_balance += seller_share
+
+            seller_wallet.save(
+                update_fields=[
+                    "available_balance",
+                    "updated_at",
+                ]
+            )
+
+            FinancialTransaction.objects.create(
+                user_id=seller_id,
+                transaction_type="adjustment",
+                status="completed",
+                amount=seller_share,
+                reference=(
+                    f"REVERSAL-FEE-SHOP-{order.id}-{seller_id}"
+                ),
+                description=(
+                    f"Seller share of ₦1,500 reversal fee "
+                    f"for order #{order.id}."
+                ),
+                order=order,
+            )
+
+        # -----------------------------------------------------
+        # ₦500 admin share.
+        # -----------------------------------------------------
+        admin_wallet.available_balance += ADMIN_SHARE
+
+        admin_wallet.save(
+            update_fields=[
+                "available_balance",
+                "updated_at",
+            ]
+        )
+
+        FinancialTransaction.objects.create(
+            user=admin,
+            transaction_type="adjustment",
+            status="completed",
+            amount=ADMIN_SHARE,
+            reference=f"REVERSAL-FEE-ADMIN-{order.id}",
+            description=(
+                f"Admin share of ₦1,500 reversal fee "
+                f"for order #{order.id}."
+            ),
+            order=order,
+        )
+
+        # -----------------------------------------------------
+        # Cancel order and restore stock.
+        # -----------------------------------------------------
+        order.status = "cancelled"
+
+        order.save(
+            update_fields=[
+                "status",
+                "updated_at",
+            ]
+        )
+
+        restore_order_stock(order)
+
+        return {
+            "status": "cancelled",
+            "order_id": order.id,
+            "refund_amount": str(refund_amount - reversal_fee),
+            "original_amount": str(refund_amount),
+            "reversal_fee": str(reversal_fee),
+            "payment_method": "paystack",
+            "payment_status": "paid",
+            "refund_method": "mua_wallet",
+        }
+
+    # Customer Product orders do not have a reversal fee.
+    # Shop Product orders keep the existing ₦1,500 reversal fee.
+    is_customer_product_order = order.items.filter(
+        customer_product__isnull=False
+    ).exists()
+
+    if is_customer_product_order:
+        REVERSAL_FEE = Decimal("0.00")
+        SHOP_SHARE = Decimal("0.00")
+        ADMIN_SHARE = Decimal("0.00")
+
+    refund_amount = Decimal("0.00")
+    reversal_fee = Decimal("0.00")
+
+    # =========================================================
+    # WALLET ORDER
+    # =========================================================
+    if order.payment_method == "wallet":
+
+        hold_reference = f"PURCHASE-HOLD-{order.id}"
+
+        hold_transaction = (
+            FinancialTransaction.objects
+            .select_for_update()
+            .filter(
+                reference=hold_reference,
+                transaction_type="purchase_hold",
+            )
+            .first()
+        )
+
+        if not hold_transaction:
+            raise ValueError(
+                "The wallet payment hold for this order was not found."
+            )
+
+        if hold_transaction.status != "completed":
+            raise ValueError(
+                "The wallet payment hold is not available for reversal."
+            )
+
+        held_amount = Decimal(hold_transaction.amount)
+
+        if not is_customer_product_order:
+            if held_amount <= REVERSAL_FEE:
+                raise ValueError(
+                    "The order amount is too small to cover the ₦1,500 "
+                    "reversal fee."
+                )
+
+        refund_amount = held_amount - REVERSAL_FEE
+        reversal_fee = REVERSAL_FEE
+
+        # -----------------------------------------------------
+        # Customer wallet
+        # -----------------------------------------------------
+        customer_wallet = (
+            Wallet.objects
+            .select_for_update()
+            .get(owner=order.customer)
+        )
+
+        if customer_wallet.held_balance < held_amount:
+            raise ValueError(
+                "Customer held balance is insufficient "
+                "to cancel this order."
+            )
+
+        # -----------------------------------------------------
+        # Find pending seller transactions.
+        # -----------------------------------------------------
+        sale_transactions = list(
+            FinancialTransaction.objects
+            .select_for_update()
+            .filter(
+                order=order,
+                transaction_type="sale_pending",
+                status="pending",
+            )
+            .order_by("id")
+        )
+
+        if not sale_transactions:
+            raise ValueError(
+                "No pending seller earnings were found for this order."
+            )
+
+        total_sales = sum(
+            (Decimal(tx.amount) for tx in sale_transactions),
+            Decimal("0.00"),
+        )
+
+        if total_sales <= Decimal("0.00"):
+            raise ValueError(
+                "The order has no valid seller earnings."
+            )
+
+        # -----------------------------------------------------
+        # Admin wallet is only needed for Shop Product
+        # reversal fees. Customer Product cancellations
+        # have no reversal fee.
+        # -----------------------------------------------------
+        admin = None
+        admin_wallet = None
+
+        if reversal_fee > Decimal("0.00"):
+            admin = (
+                User.objects
+                .filter(
+                    role="admin",
+                    is_active=True,
+                )
+                .order_by("id")
+                .first()
+            )
+
+            if not admin:
+                raise ValueError(
+                    "No active admin account is available for the "
+                    "reversal fee."
+                )
+
+            admin_wallet, _ = Wallet.objects.get_or_create(
+                owner=admin
+            )
+
+            admin_wallet = (
+                Wallet.objects
+                .select_for_update()
+                .get(pk=admin_wallet.pk)
+            )
+
+        # -----------------------------------------------------
+        # Return customer's full money for Customer Products.
+        # Shop Products return money minus the reversal fee.
+        # -----------------------------------------------------
+        customer_wallet.held_balance -= held_amount
+        customer_wallet.available_balance += refund_amount
+
+        customer_wallet.save(
+            update_fields=[
+                "held_balance",
+                "available_balance",
+                "updated_at",
+            ]
+        )
+
+        # -----------------------------------------------------
+        # Customer refund transaction.
+        # -----------------------------------------------------
+        refund_description = (
+            f"Full wallet refund after cancellation of "
+            f"Customer Product order #{order.id}."
+            if is_customer_product_order
+            else (
+                f"Wallet refund after cancellation of "
+                f"order #{order.id}. "
+                f"₦1,500 reversal fee deducted."
+            )
+        )
+
+        FinancialTransaction.objects.get_or_create(
+            reference=f"PURCHASE-REFUND-{order.id}",
+            defaults={
+                "user": order.customer,
+                "transaction_type": "purchase_refund",
+                "status": "completed",
+                "amount": refund_amount,
+                "description": refund_description,
+                "order": order,
+            },
+        )
+
+        # -----------------------------------------------------
+        # Reverse seller pending earnings.
+        # -----------------------------------------------------
+        seller_amounts = {}
+
+        for sale_transaction in sale_transactions:
+            seller_id = sale_transaction.user_id
+
+            seller_amounts.setdefault(
+                seller_id,
+                Decimal("0.00"),
+            )
+
+            seller_amounts[seller_id] += Decimal(
+                sale_transaction.amount
+            )
+
+        # First reverse the original pending earnings.
+        for sale_transaction in sale_transactions:
+
+            seller_wallet = (
+                Wallet.objects
+                .select_for_update()
+                .get(owner_id=sale_transaction.user_id)
+            )
+
+            amount = Decimal(sale_transaction.amount)
+
+            seller_wallet.pending_balance -= amount
+
+            if seller_wallet.pending_balance < Decimal("0.00"):
+                seller_wallet.pending_balance = Decimal("0.00")
+
+            seller_wallet.save(
+                update_fields=[
+                    "pending_balance",
+                    "updated_at",
+                ]
+            )
+
+            sale_transaction.status = "reversed"
+
+            sale_transaction.save(
+                update_fields=[
+                    "status",
+                    "updated_at",
+                ]
+            )
+
+        # -----------------------------------------------------
+        # Distribute the Shop Product reversal fee.
+        #
+        # Customer Product cancellations have no fee, so this
+        # entire section is skipped for Customer Products.
+        # -----------------------------------------------------
+        if reversal_fee > Decimal("0.00"):
+            remaining_shop_share = SHOP_SHARE
+            seller_ids = list(seller_amounts.keys())
+
+            for index, seller_id in enumerate(seller_ids):
+
+                seller_amount = seller_amounts[seller_id]
+
+                if index == len(seller_ids) - 1:
+                    seller_share = remaining_shop_share
+                else:
+                    seller_share = (
+                        SHOP_SHARE
+                        * seller_amount
+                        / total_sales
+                    ).quantize(Decimal("0.01"))
+
+                    if seller_share > remaining_shop_share:
+                        seller_share = remaining_shop_share
+
+                remaining_shop_share -= seller_share
+
+                seller_wallet = (
+                    Wallet.objects
+                    .select_for_update()
+                    .get(owner_id=seller_id)
+                )
+
+                seller_wallet.available_balance += seller_share
+
+                seller_wallet.save(
+                    update_fields=[
+                        "available_balance",
+                        "updated_at",
+                    ]
+                )
+
+                FinancialTransaction.objects.create(
+                    user_id=seller_id,
+                    transaction_type="adjustment",
+                    status="completed",
+                    amount=seller_share,
+                    reference=(
+                        f"REVERSAL-FEE-SHOP-{order.id}-{seller_id}"
+                    ),
+                    description=(
+                        f"Seller share of ₦1,500 reversal fee "
+                        f"for order #{order.id}."
+                    ),
+                    order=order,
+                )
+
+            # -------------------------------------------------
+            # ₦500 goes to admin.
+            # -------------------------------------------------
+            admin_wallet.available_balance += ADMIN_SHARE
+
+            admin_wallet.save(
+                update_fields=[
+                    "available_balance",
+                    "updated_at",
+                ]
+            )
+
+            FinancialTransaction.objects.create(
+                user=admin,
+                transaction_type="adjustment",
+                status="completed",
+                amount=ADMIN_SHARE,
+                reference=f"REVERSAL-FEE-ADMIN-{order.id}",
+                description=(
+                    f"Admin share of ₦1,500 reversal fee "
+                    f"for order #{order.id}."
+                ),
+                order=order,
+            )
+
+        # -----------------------------------------------------
+        # Mark customer's original wallet hold as reversed.
+        # -----------------------------------------------------
+        hold_transaction.status = "reversed"
+
+        hold_transaction.save(
+            update_fields=[
+                "status",
+                "updated_at",
+            ]
+        )
+
+    # =========================================================
+    # FINAL ORDER CANCELLATION
+    # =========================================================
+
+    order.status = "cancelled"
+
+    order.save(
+        update_fields=[
+            "status",
+            "updated_at",
+        ]
+    )
+
+    restore_order_stock(order)
+
+    return {
+        "status": "cancelled",
+        "order_id": order.id,
+        "refund_amount": str(refund_amount),
+        "reversal_fee": str(reversal_fee),
+    }
+
+
+# =========================================================
+# RELEASE SHOP EARNINGS + ADMIN COMMISSION
+# =========================================================
+
+@transaction.atomic
+def release_order_earnings(order):
+    """
+    Customer confirmed receipt.
+
+    Wallet-paid order:
+        buyer held balance is released/cleared
+        seller pending -> seller available
+        admin receives commission
+
+    Supports both shop products and customer products.
+
+    Commission is created exactly once per order item.
+    """
+
+    order = (
+        Order.objects
+        .select_for_update()
+        .select_related("customer")
+        .get(pk=order.pk)
+    )
+
+    if order.delivery_status != "received":
+        raise ValueError(
+            "Order must be marked received before earnings "
+            "can be released."
+        )
+
+    admin = (
+        User.objects
+        .filter(
+            role="admin",
+            is_active=True,
+        )
+        .order_by("id")
+        .first()
+    )
+
+    if not admin:
+        raise ValueError(
+            "No active admin account is available for commission."
+        )
+
+    admin_wallet, _ = Wallet.objects.get_or_create(
+        owner=admin
+    )
+
+    # ========================================================
+    # RELEASE BUYER'S WALLET HOLD
+    # ========================================================
+
+    if order.payment_method == "wallet":
+        hold_reference = f"PURCHASE-HOLD-{order.id}"
+
+        hold_transaction = (
+            FinancialTransaction.objects
+            .select_for_update()
+            .filter(
+                reference=hold_reference,
+                transaction_type="purchase_hold",
+            )
+            .first()
+        )
+
+        if hold_transaction:
+            if hold_transaction.status == "completed":
+                amount = Decimal(hold_transaction.amount)
+
+                buyer_wallet = (
+                    Wallet.objects
+                    .select_for_update()
+                    .get(owner=order.customer)
+                )
+
+                if buyer_wallet.held_balance < amount:
+                    raise ValueError(
+                        "Customer held balance is insufficient "
+                        "to release this order."
+                    )
+
+                buyer_wallet.held_balance -= amount
+
+                buyer_wallet.save(
+                    update_fields=[
+                        "held_balance",
+                        "updated_at",
+                    ]
+                )
+
+                hold_transaction.status = "reversed"
+                hold_transaction.save(
+                    update_fields=[
+                        "status",
+                        "updated_at",
+                    ]
+                )
+
+                FinancialTransaction.objects.get_or_create(
+                    reference=f"PURCHASE-RELEASE-{order.id}",
+                    defaults={
+                        "user": order.customer,
+                        "transaction_type": "purchase_release",
+                        "status": "completed",
+                        "amount": amount,
+                        "description": (
+                            f"Wallet hold released after "
+                            f"receipt of order #{order.id}"
+                        ),
+                        "order": order,
+                    },
+                )
+
+    # ========================================================
+    # RELEASE SELLER EARNINGS + ADMIN COMMISSION
+    # ========================================================
+
+    for item in order.items.select_related(
+        "product__shop__owner",
+        "customer_product__seller",
+    ).all():
+
+        if item.product_id:
+            seller = item.product.shop.owner
+            product_name = item.product.name
+            shop = item.product.shop
+
+        elif item.customer_product_id:
+            seller = item.customer_product.seller
+            product_name = item.customer_product.name
+            shop = None
+
+        else:
+            raise ValueError(
+                f"Order item {item.id} has no product."
+            )
+
+        sale_amount = Decimal(item.price) * item.quantity
+
+        commission_amount = (
+            COMMISSION_PER_UNIT * item.quantity
+        )
+
+        if sale_amount < commission_amount:
+            raise ValueError(
+                f"Commission for {product_name} "
+                f"cannot exceed the sale amount."
+            )
+
+        seller_net = sale_amount - commission_amount
+
+        sale_reference = f"SALE-{order.id}-{item.id}"
+
+        sale_transaction = (
+            FinancialTransaction.objects
+            .select_for_update()
+            .filter(
+                reference=sale_reference,
+                transaction_type="sale_pending",
+            )
+            .first()
+        )
+
+        if not sale_transaction:
+            raise ValueError(
+                f"Pending sale record for order item "
+                f"{item.id} was not found."
+            )
+
+        if sale_transaction.status == "completed":
+            continue
+
+        seller_wallet = (
+            Wallet.objects
+            .select_for_update()
+            .get(owner=seller)
+        )
+
+        if seller_wallet.pending_balance < sale_amount:
+            raise ValueError(
+                f"Seller pending balance is insufficient "
+                f"for order item {item.id}."
+            )
+
+        seller_wallet.pending_balance -= sale_amount
+        seller_wallet.available_balance += seller_net
+
+        seller_wallet.save(
+            update_fields=[
+                "pending_balance",
+                "available_balance",
+                "updated_at",
+            ]
+        )
+
+        sale_transaction.transaction_type = "sale_released"
+        sale_transaction.status = "completed"
+
+        sale_transaction.save(
+            update_fields=[
+                "transaction_type",
+                "status",
+                "updated_at",
+            ]
+        )
+
+        commission, created = (
+            AdminCommission.objects.get_or_create(
+                order_item=item,
+                defaults={
+                    "order": order,
+                    "shop": shop,
+                    "seller": seller,
+                    "quantity": item.quantity,
+                    "amount_per_unit": COMMISSION_PER_UNIT,
+                    "total_amount": commission_amount,
+                },
+            )
+        )
+
+        if created:
+            admin_wallet.available_balance += commission_amount
+
+            admin_wallet.save(
+                update_fields=[
+                    "available_balance",
+                    "updated_at",
+                ]
+            )
+
+            FinancialTransaction.objects.create(
+                user=admin,
+                transaction_type="commission",
+                status="completed",
+                amount=commission_amount,
+                reference=f"COMMISSION-{order.id}-{item.id}",
+                description=(
+                    f"Admin commission for {product_name}"
+                ),
+                order=order,
+            )
+
+
+# =========================================================
+# REFUND PROCESSING
+# =========================================================
+
+@transaction.atomic
+def process_refund_payment(refund_request):
+    """
+    Reserve the shop owner's money for a refund.
+    """
+
+    if refund_request.status != "accepted":
+        raise ValueError(
+            "Only an accepted refund can be processed."
+        )
+
+    existing_refund = (
+        FinancialTransaction.objects
+        .filter(
+            refund_request=refund_request,
+            transaction_type="refund",
+        )
+        .first()
+    )
+
+    if existing_refund:
+        raise ValueError(
+            "This refund has already been prepared for processing."
+        )
+
+    if not refund_request.bank_account:
+        raise ValueError(
+            "A bank account is required before processing the refund."
+        )
+
+    if not refund_request.bank_account.is_verified:
+        raise ValueError(
+            "The selected bank account must be verified."
+        )
+
+    order = refund_request.order
+    shop = refund_request.shop
+    owner = shop.owner
+
+    refund_amount = refund_request.offered_amount
+
+    if refund_amount is None:
+        raise ValueError(
+            "No refund offer amount has been set."
+        )
+
+    refund_amount = Decimal(refund_amount)
+
+    if refund_amount <= Decimal("0.00"):
+        raise ValueError(
+            "Refund amount must be greater than zero."
+        )
+
+    shop_items = (
+        order.items
+        .select_related("product__shop")
+        .filter(product__shop=shop)
+    )
+
+    if not shop_items.exists():
+        raise ValueError(
+            "This shop does not have products in this order."
+        )
+
+    shop_earnings = Decimal("0.00")
+
+    for item in shop_items:
+
+        sale_amount = item.price * item.quantity
+
+        commission_amount = (
+            COMMISSION_PER_UNIT * item.quantity
+        )
+
+        owner_earning = (
+            sale_amount - commission_amount
+        )
+
+        if owner_earning > Decimal("0.00"):
+            shop_earnings += owner_earning
+
+    if refund_amount > shop_earnings:
+        raise ValueError(
+            "Refund amount cannot exceed the shop's earnings from this order."
+        )
+
+    wallet = (
+        Wallet.objects
+        .select_for_update()
+        .get(owner=owner)
+    )
+
+    sale_transactions = (
+        FinancialTransaction.objects
+        .select_for_update()
+        .filter(
+            user=owner,
+            order=order,
+            transaction_type__in=[
+                "sale_pending",
+                "sale_released",
+            ],
+        )
+        .order_by("-created_at")
+    )
+
+    sale_transaction = sale_transactions.first()
+
+    pending_used = Decimal("0.00")
+
+    if (
+        sale_transaction
+        and sale_transaction.transaction_type
+        == "sale_pending"
+    ):
+
+        pending_used = min(
+            wallet.pending_balance,
+            refund_amount,
+        )
+
+        wallet.pending_balance -= pending_used
+
+        remaining_refund = (
+            refund_amount - pending_used
+        )
+
+    else:
+        remaining_refund = refund_amount
+
+    available_used = Decimal("0.00")
+
+    if remaining_refund > Decimal("0.00"):
+
+        if wallet.available_balance < remaining_refund:
+            raise ValueError(
+                "Shop owner does not have enough balance to cover this refund."
+            )
+
+        available_used = remaining_refund
+        wallet.available_balance -= available_used
+
+    wallet.save(
+        update_fields=[
+            "pending_balance",
+            "available_balance",
+            "updated_at",
+        ]
+    )
+
+    refund_request.reserved_pending_amount = pending_used
+    refund_request.reserved_available_amount = available_used
+
+    refund_request.save(
+        update_fields=[
+            "reserved_pending_amount",
+            "reserved_available_amount",
+            "updated_at",
+        ]
+    )
+
+    if sale_transaction:
+        sale_transaction.status = "reversed"
+
+        sale_transaction.save(
+            update_fields=[
+                "status",
+                "updated_at",
+            ]
+        )
+
+    FinancialTransaction.objects.create(
+        user=refund_request.customer,
+        transaction_type="refund",
+        status="pending",
+        amount=refund_amount,
+        reference=f"REFUND-{refund_request.id}",
+        description=(
+            f"Refund pending for Order #{order.id} "
+            f"from {shop.name}"
+        ),
+        order=order,
+        refund_request=refund_request,
+    )
+
+    FinancialTransaction.objects.create(
+        user=owner,
+        transaction_type="refund_reversal",
+        status="completed",
+        amount=refund_amount,
+        reference=(
+            f"REFUND-REVERSAL-{refund_request.id}"
+        ),
+        description=(
+            f"Refund amount reserved from Order #{order.id} "
+            f"for {shop.name}. "
+            f"Pending: ₦{pending_used}, "
+            f"Available: ₦{available_used}."
+        ),
+        order=order,
+        refund_request=refund_request,
+    )
+
+    refund_request.status = "processing"
+
+    refund_request.save(
+        update_fields=[
+            "status",
+            "updated_at",
+        ]
+    )
+
+    return refund_request
+
+
+# =========================================================
+# CREATE REFUND REQUEST
+# =========================================================
+
+@transaction.atomic
+def create_refund_request(
+    order,
+    customer,
+    shop,
+    reason,
+):
+    """
+    Create a refund request for one shop's portion of an order.
+    """
+
+    if order.customer_id != customer.id:
+        raise ValueError(
+            "You can only request a refund for your own order."
+        )
+
+    if order.status != "delivered":
+        raise ValueError(
+            "A refund can only be requested for a delivered order."
+        )
+
+    if order.delivery_status != "rejected":
+        raise ValueError(
+            "You must reject the delivered order before requesting a refund."
+        )
+
+    shop_items = (
+        order.items
+        .select_related("product__shop")
+        .filter(product__shop=shop)
+    )
+
+    if not shop_items.exists():
+        raise ValueError(
+            "This shop does not have products in this order."
+        )
+
+    existing_request = (
+        RefundRequest.objects
+        .filter(
+            order=order,
+            shop=shop,
+        )
+        .exclude(
+            status__in=[
+                "cancelled",
+                "failed",
+            ]
+        )
+        .exists()
+    )
+
+    if existing_request:
+        raise ValueError(
+            "A refund request already exists for this shop."
+        )
+
+    requested_amount = Decimal("0.00")
+
+    for item in shop_items:
+        requested_amount += (
+            item.price * item.quantity
+        )
+
+    refund_request = RefundRequest.objects.create(
+        order=order,
+        customer=customer,
+        shop=shop,
+        reason=reason,
+        requested_amount=requested_amount,
+        delivery_fee=Decimal("0.00"),
+        offered_amount=None,
+        status="requested",
+    )
+
+    return refund_request
+
+
+# =========================================================
+# REFUND OFFER
+# =========================================================
+
+@transaction.atomic
+def send_refund_offer(
+    refund_request,
+    shop_owner,
+    delivery_fee,
+    offered_amount,
+    shop_note="",
+):
+    """
+    Shop owner sends a refund offer.
+    """
+
+    if refund_request.shop.owner_id != shop_owner.id:
+        raise ValueError(
+            "You can only manage refunds for your own shop."
+        )
+
+    if refund_request.status != "requested":
+        raise ValueError(
+            "This refund request is no longer waiting for an offer."
+        )
+
+    if delivery_fee < Decimal("0.00"):
+        raise ValueError(
+            "Delivery fee cannot be negative."
+        )
+
+    if offered_amount < Decimal("0.00"):
+        raise ValueError(
+            "Refund amount cannot be negative."
+        )
+
+    if delivery_fee > refund_request.requested_amount:
+        raise ValueError(
+            "Delivery fee cannot exceed the requested refund amount."
+        )
+
+    maximum_refund = (
+        refund_request.requested_amount
+        - delivery_fee
+    )
+
+    if offered_amount > maximum_refund:
+        raise ValueError(
+            "Offered refund cannot exceed the requested amount after delivery fee."
+        )
+
+    refund_request.delivery_fee = delivery_fee
+    refund_request.offered_amount = offered_amount
+    refund_request.shop_note = shop_note
+    refund_request.status = "offer_sent"
+
+    refund_request.save(
+        update_fields=[
+            "delivery_fee",
+            "offered_amount",
+            "shop_note",
+            "status",
+            "updated_at",
+        ]
+    )
+
+    return refund_request
+
+
+# =========================================================
+# CUSTOMER REFUND RESPONSE
+# =========================================================
+
+@transaction.atomic
+def respond_to_refund_offer(
+    refund_request,
+    customer,
+    response,
+    bank_account=None,
+):
+    """
+    Customer responds to a refund offer.
+    """
+
+    if refund_request.customer_id != customer.id:
+        raise ValueError(
+            "You can only respond to your own refund request."
+        )
+
+    valid_responses = [
+        "accept",
+        "reject",
+        "receive_product",
+        "reject_product_again",
+    ]
+
+    if response not in valid_responses:
+        raise ValueError(
+            "Invalid refund response."
+        )
+
+    if response == "accept":
+
+        if refund_request.status != "offer_sent":
+            raise ValueError(
+                "A refund can only be accepted after the shop sends an offer."
+            )
+
+        if bank_account is None:
+            raise ValueError(
+                "A verified bank account is required to accept the refund."
+            )
+
+        if bank_account.user_id != customer.id:
+            raise ValueError(
+                "The selected bank account does not belong to this customer."
+            )
+
+        if not bank_account.is_verified:
+            raise ValueError(
+                "The selected bank account has not been verified."
+            )
+
+        refund_request.status = "accepted"
+        refund_request.bank_account = bank_account
+
+    elif response == "reject":
+
+        if refund_request.status != "offer_sent":
+            raise ValueError(
+                "A refund offer can only be rejected after the shop sends an offer."
+            )
+
+        refund_request.status = "rejected"
+
+    elif response == "receive_product":
+
+        if refund_request.status != "rejected":
+            raise ValueError(
+                "You can only choose to receive the product after rejecting the refund offer."
+            )
+
+        refund_request.status = "receiving_product"
+
+    elif response == "reject_product_again":
+
+        if refund_request.status != "rejected":
+            raise ValueError(
+                "You can only dispute the product after rejecting the refund offer."
+            )
+
+        refund_request.status = "disputed"
+
+    update_fields = [
+        "status",
+        "updated_at",
+    ]
+
+    if response == "accept":
+        update_fields.append("bank_account")
+
+    refund_request.save(
+        update_fields=update_fields
+    )
+
+    return refund_request
+
+
+# =========================================================
+# PAYSTACK REFUND RECIPIENT
+# =========================================================
+
+def create_paystack_transfer_recipient(refund_request):
+    """
+    Create a Paystack recipient for a customer's verified bank.
+    """
+
+    bank_account = refund_request.bank_account
+
+    if not bank_account:
+        raise ValueError(
+            "A bank account is required for the refund payout."
+        )
+
+    if not bank_account.is_verified:
+        raise ValueError(
+            "The customer's bank account must be verified."
+        )
+
+    if refund_request.paystack_recipient_code:
+        return refund_request.paystack_recipient_code
+
+    headers = _paystack_headers()
+
+    payload = {
+        "type": "nuban",
+        "name": bank_account.account_name,
+        "account_number": bank_account.account_number,
+        "bank_code": bank_account.bank_code,
+        "currency": "NGN",
+    }
+
+    try:
+        response = requests.post(
+            "https://api.paystack.co/transferrecipient",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+    except requests.RequestException:
+        raise ValueError(
+            "Unable to connect to Paystack while creating the transfer recipient."
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            "Paystack returned an invalid recipient response."
+        )
+
+    if response.status_code not in (200, 201) or not data.get("status"):
+        raise ValueError(
+            data.get(
+                "message",
+                "Paystack could not create the transfer recipient.",
+            )
+        )
+
+    recipient_data = data.get("data") or {}
+
+    recipient_code = recipient_data.get(
+        "recipient_code"
+    )
+
+    if not recipient_code:
+        raise ValueError(
+            "Paystack did not return a recipient code."
+        )
+
+    refund_request.paystack_recipient_code = recipient_code
+
+    refund_request.save(
+        update_fields=[
+            "paystack_recipient_code",
+            "updated_at",
+        ]
+    )
+
+    return recipient_code
+
+
+# =========================================================
+# INITIATE PAYSTACK REFUND
+# =========================================================
+
+@transaction.atomic
+def initiate_paystack_refund(refund_request):
+    """
+    Initiate actual Paystack refund transfer.
+    """
+
+    refund_request = (
+        RefundRequest.objects
+        .select_for_update()
+        .select_related(
+            "bank_account",
+            "customer",
+            "shop",
+        )
+        .get(pk=refund_request.pk)
+    )
+
+    if refund_request.status != "processing":
+        raise ValueError(
+            "Only a refund in processing status can be paid out."
+        )
+
+    if not refund_request.bank_account:
+        raise ValueError(
+            "A bank account is required for the refund payout."
+        )
+
+    if not refund_request.bank_account.is_verified:
+        raise ValueError(
+            "The customer's bank account must be verified."
+        )
+
+    refund_amount = refund_request.offered_amount
+
+    if refund_amount is None:
+        raise ValueError(
+            "The refund does not have an offered amount."
+        )
+
+    refund_amount = Decimal(refund_amount)
+
+    if refund_amount <= Decimal("0.00"):
+        raise ValueError(
+            "Refund amount must be greater than zero."
+        )
+
+    if refund_request.payout_reference:
+        raise ValueError(
+            "A Paystack payout has already been initiated for this refund."
+        )
+
+    recipient_code = create_paystack_transfer_recipient(
+        refund_request
+    )
+
+    amount_kobo = int(
+        refund_amount * Decimal("100")
+    )
+
+    reference = (
+        f"mua-refund-payout-{refund_request.id}"
+    )
+
+    headers = _paystack_headers()
+
+    payload = {
+        "source": "balance",
+        "amount": amount_kobo,
+        "recipient": recipient_code,
+        "reference": reference,
+        "reason": (
+            f"Refund for Order #{refund_request.order_id}"
+        ),
+        "currency": "NGN",
+    }
+
+    try:
+        response = requests.post(
+            "https://api.paystack.co/transfer",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+    except requests.RequestException:
+        raise ValueError(
+            "Unable to connect to Paystack while initiating the refund payout."
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            "Paystack returned an invalid transfer response."
+        )
+
+    if response.status_code not in (200, 201) or not data.get("status"):
+        raise ValueError(
+            data.get(
+                "message",
+                "Paystack could not initiate the refund payout.",
+            )
+        )
+
+    transfer_data = data.get("data") or {}
+
+    returned_reference = (
+        transfer_data.get("reference")
+        or reference
+    )
+
+    refund_request.payout_reference = returned_reference
+    refund_request.payout_failure_reason = ""
+
+    refund_request.save(
+        update_fields=[
+            "payout_reference",
+            "payout_failure_reason",
+            "updated_at",
+        ]
+    )
+
+    return {
+        "reference": returned_reference,
+        "status": transfer_data.get(
+            "status",
+            "pending",
+        ),
+        "transfer_code": transfer_data.get(
+            "transfer_code"
+        ),
+        "amount": refund_amount,
+        "amount_kobo": amount_kobo,
+    }
+
+
+# =========================================================
+# VERIFY PAYSTACK REFUND
+# =========================================================
+
+@transaction.atomic
+def verify_paystack_refund(refund_request):
+    """
+    Verify an already initiated Paystack refund.
+    """
+
+    refund_request = (
+        RefundRequest.objects
+        .select_for_update()
+        .select_related("shop__owner")
+        .get(pk=refund_request.pk)
+    )
+
+    if not refund_request.payout_reference:
+        raise ValueError(
+            "No Paystack payout has been initiated for this refund."
+        )
+
+    if refund_request.status in ["paid", "failed"]:
+        return refund_request
+
+    headers = _paystack_headers()
+
+    try:
+        response = requests.get(
+            "https://api.paystack.co/transfer/verify/"
+            f"{refund_request.payout_reference}",
+            headers=headers,
+            timeout=20,
+        )
+    except requests.RequestException:
+        raise ValueError(
+            "Unable to connect to Paystack while verifying the refund payout."
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            "Paystack returned an invalid verification response."
+        )
+
+    if response.status_code != 200 or not data.get("status"):
+        raise ValueError(
+            data.get(
+                "message",
+                "Paystack could not verify the refund payout.",
+            )
+        )
+
+    transfer_data = data.get("data") or {}
+
+    transfer_status = (
+        transfer_data.get("status") or ""
+    ).lower()
+
+    refund_transaction = (
+        FinancialTransaction.objects
+        .select_for_update()
+        .filter(
+            refund_request=refund_request,
+            transaction_type="refund",
+        )
+        .first()
+    )
+
+    if transfer_status == "success":
+
+        if refund_transaction:
+            refund_transaction.status = "completed"
+
+            refund_transaction.save(
+                update_fields=[
+                    "status",
+                    "updated_at",
+                ]
+            )
+
+        refund_request.status = "paid"
+        refund_request.payout_failure_reason = ""
+        refund_request.paid_at = timezone.now()
+
+        refund_request.save(
+            update_fields=[
+                "status",
+                "payout_failure_reason",
+                "paid_at",
+                "updated_at",
+            ]
+        )
+
+        return refund_request
+
+    if transfer_status in ["failed", "reversed"]:
+
+        reason = (
+            transfer_data.get("failures")
+            or transfer_data.get("reason")
+            or "Paystack transfer was not successful."
+        )
+
+        wallet = (
+            Wallet.objects
+            .select_for_update()
+            .get(owner=refund_request.shop.owner)
+        )
+
+        reserved_pending = (
+            refund_request.reserved_pending_amount
+            or Decimal("0.00")
+        )
+
+        reserved_available = (
+            refund_request.reserved_available_amount
+            or Decimal("0.00")
+        )
+
+        wallet.pending_balance += reserved_pending
+        wallet.available_balance += reserved_available
+
+        wallet.save(
+            update_fields=[
+                "pending_balance",
+                "available_balance",
+                "updated_at",
+            ]
+        )
+
+        if refund_transaction:
+
+            refund_transaction.status = "failed"
+
+            refund_transaction.description = (
+                f"{refund_transaction.description}\n"
+                f"Paystack payout {transfer_status}: {reason}\n"
+                f"Wallet restored: "
+                f"Pending ₦{reserved_pending}, "
+                f"Available ₦{reserved_available}."
+            )
+
+            refund_transaction.save(
+                update_fields=[
+                    "status",
+                    "description",
+                    "updated_at",
+                ]
+            )
+
+        refund_request.reserved_pending_amount = Decimal("0.00")
+        refund_request.reserved_available_amount = Decimal("0.00")
+        refund_request.status = "failed"
+        refund_request.payout_failure_reason = str(reason)
+
+        refund_request.save(
+            update_fields=[
+                "reserved_pending_amount",
+                "reserved_available_amount",
+                "status",
+                "payout_failure_reason",
+                "updated_at",
+            ]
+        )
+
+        return refund_request
+
+    return refund_request
+
+
+# =========================================================
+# RESTORE ORDER STOCK
+# =========================================================
+
+@transaction.atomic
+def restore_order_stock(order):
+    """
+    Restore stock reserved by an order.
+
+    Supports both:
+        Shop Product
+        Customer Product
+    """
+
+    order = (
+        order.__class__.objects
+        .select_for_update()
+        .get(pk=order.pk)
+    )
+
+    if order.stock_restored:
+        return order
+
+    items = (
+        order.items
+        .select_related(
+            "product",
+            "customer_product",
+        )
+        .select_for_update()
+    )
+
+    for item in items:
+
+        if item.product_id:
+            product = item.product
+
+            product.quantity += item.quantity
+            product.is_available = product.quantity > 0
+
+            product.save(
+                update_fields=[
+                    "quantity",
+                    "is_available",
+                    "updated_at",
+                ]
+            )
+
+        elif item.customer_product_id:
+            product = item.customer_product
+
+            product.quantity += item.quantity
+            product.is_available = product.quantity > 0
+
+            product.save(
+                update_fields=[
+                    "quantity",
+                    "is_available",
+                    "updated_at",
+                ]
+            )
+
+        else:
+            raise ValueError(
+                f"Order item {item.id} has no product to restore."
+            )
+
+    order.stock_restored = True
+
+    order.save(
+        update_fields=[
+            "stock_restored",
+            "updated_at",
+        ]
+    )
+
+    return order
+
+
+# =========================================================
+# SHOP OWNER CANCEL ORDER
+# =========================================================
+
+@transaction.atomic
+def cancel_shop_order(order, owner):
+    """
+    Cancel an order by the seller/shop owner.
+
+    Seller cancellation rules:
+        - Customer receives the COMPLETE amount.
+        - No reversal fee.
+        - Seller receives nothing.
+        - Admin receives nothing.
+        - Wallet payment is returned from held balance.
+        - Paystack payment is credited to the MUA Wallet.
+        - No external Paystack refund is performed.
+        - Seller pending earnings are reversed.
+        - Stock is restored.
+    """
+
+    order = (
+        Order.objects
+        .select_for_update()
+        .get(pk=order.pk)
+    )
+
+    if order.status == "cancelled":
+        raise ValueError(
+            "A cancelled order cannot be cancelled again."
+        )
+
+    if order.status == "delivered":
+        raise ValueError(
+            "A delivered order cannot be cancelled."
+        )
+
+    # ---------------------------------------------------------
+    # VERIFY SELLER OWNS THE ORDER ITEMS
+    # ---------------------------------------------------------
+
+    items = list(
+        order.items
+        .select_related(
+            "product__shop__owner",
+            "customer_product__seller",
+        )
+        .select_for_update()
+    )
+
+    if not items:
+        raise ValueError(
+            "This order has no items."
+        )
+
+    for item in items:
+
+        if item.product_id:
+
+            if (
+                not item.product.shop_id
+                or item.product.shop.owner_id != owner.id
+            ):
+                raise ValueError(
+                    "You cannot cancel an order containing "
+                    "products belonging to another shop."
+                )
+
+        elif item.customer_product_id:
+
+            if item.customer_product.seller_id != owner.id:
+                raise ValueError(
+                    "You cannot cancel an order containing "
+                    "products belonging to another seller."
+                )
+
+        else:
+            raise ValueError(
+                f"Order item {item.id} has no seller."
+            )
+
+    # ---------------------------------------------------------
+    # UNPAID ORDER
+    # ---------------------------------------------------------
+
+    if order.payment_status != "paid":
+
+        order.status = "cancelled"
+
+        order.save(
+            update_fields=[
+                "status",
+                "updated_at",
+            ]
+        )
+
+        restore_order_stock(order)
+
+        return {
+            "status": "cancelled",
+            "order_id": order.id,
+            "refund_amount": "0.00",
+            "reversal_fee": "0.00",
+            "payment_method": order.payment_method,
+            "payment_status": order.payment_status,
+            "refund_method": "none",
+        }
+
+    # ---------------------------------------------------------
+    # FIND SELLER PENDING EARNINGS
+    # ---------------------------------------------------------
+
+    sale_transactions = list(
+        FinancialTransaction.objects
+        .select_for_update()
+        .filter(
+            order=order,
+            transaction_type="sale_pending",
+            status="pending",
+        )
+        .order_by("id")
+    )
+
+    if not sale_transactions:
+        raise ValueError(
+            "No pending seller earnings were found for this order."
+        )
+
+    # ---------------------------------------------------------
+    # CUSTOMER WALLET
+    # ---------------------------------------------------------
+
+    customer_wallet = (
+        Wallet.objects
+        .select_for_update()
+        .get(owner=order.customer)
+    )
+
+    refund_amount = Decimal("0.00")
+
+    # ---------------------------------------------------------
+    # WALLET PAYMENT
+    # ---------------------------------------------------------
+
+    if order.payment_method == "wallet":
+
+        hold_reference = f"PURCHASE-HOLD-{order.id}"
+
+        hold_transaction = (
+            FinancialTransaction.objects
+            .select_for_update()
+            .filter(
+                order=order,
+                transaction_type="purchase_hold",
+                reference=hold_reference,
+                status="completed",
+            )
+            .first()
+        )
+
+        if not hold_transaction:
+            raise ValueError(
+                "The customer's wallet hold for this order "
+                "could not be found."
+            )
+
+        refund_amount = Decimal(
+            hold_transaction.amount
+        )
+
+        if refund_amount <= Decimal("0.00"):
+            raise ValueError(
+                "The wallet hold amount must be greater than zero."
+            )
+
+        if customer_wallet.held_balance < refund_amount:
+            raise ValueError(
+                "The customer's held wallet balance is insufficient "
+                "for the full refund."
+            )
+
+        customer_wallet.held_balance -= refund_amount
+        customer_wallet.available_balance += refund_amount
+
+        customer_wallet.save(
+            update_fields=[
+                "held_balance",
+                "available_balance",
+                "updated_at",
+            ]
+        )
+
+        hold_transaction.status = "reversed"
+
+        hold_transaction.save(
+            update_fields=[
+                "status",
+                "updated_at",
+            ]
+        )
+
+    # ---------------------------------------------------------
+    # PAYSTACK PAYMENT
+    # ---------------------------------------------------------
+
+    elif order.payment_method == "paystack":
+
+        refund_amount = Decimal(
+            order.total_amount
+        )
+
+        if refund_amount <= Decimal("0.00"):
+            raise ValueError(
+                "The order amount must be greater than zero."
+            )
+
+        # IMPORTANT:
+        # Do NOT call the Paystack refund API.
+        # The complete amount goes into the customer's
+        # MUA Wallet available balance.
+
+        customer_wallet.available_balance += refund_amount
+
+        customer_wallet.save(
+            update_fields=[
+                "available_balance",
+                "updated_at",
+            ]
+        )
+
+    else:
+        raise ValueError(
+            "Seller cancellation with this payment method "
+            "is not supported."
+        )
+
+    # ---------------------------------------------------------
+    # CUSTOMER REFUND RECORD
+    # ---------------------------------------------------------
+
+    refund_reference = (
+        f"PURCHASE-REFUND-{order.id}"
+    )
+
+    refund_transaction, refund_created = (
+        FinancialTransaction.objects.get_or_create(
+            reference=refund_reference,
+            defaults={
+                "user": order.customer,
+                "transaction_type": "purchase_refund",
+                "status": "completed",
+                "amount": refund_amount,
+                "description": (
+                    f"Full wallet refund after seller "
+                    f"cancellation of order #{order.id}."
+                ),
+                "order": order,
+            },
+        )
+    )
+
+    # ---------------------------------------------------------
+    # REVERSE SELLER PENDING EARNINGS
+    # ---------------------------------------------------------
+
+    for sale_transaction in sale_transactions:
+
+        seller_wallet = (
+            Wallet.objects
+            .select_for_update()
+            .get(owner_id=sale_transaction.user_id)
+        )
+
+        amount = Decimal(
+            sale_transaction.amount
+        )
+
+        seller_wallet.pending_balance -= amount
+
+        if seller_wallet.pending_balance < Decimal("0.00"):
+            seller_wallet.pending_balance = Decimal("0.00")
+
+        seller_wallet.save(
+            update_fields=[
+                "pending_balance",
+                "updated_at",
+            ]
+        )
+
+        sale_transaction.status = "reversed"
+
+        sale_transaction.save(
+            update_fields=[
+                "status",
+                "updated_at",
+            ]
+        )
+
+    # ---------------------------------------------------------
+    # CANCEL ORDER
+    # ---------------------------------------------------------
+
+    order.status = "cancelled"
+
+    order.save(
+        update_fields=[
+            "status",
+            "updated_at",
+        ]
+    )
+
+    # ---------------------------------------------------------
+    # RESTORE STOCK
+    # ---------------------------------------------------------
+
+    restore_order_stock(order)
+
+    return {
+        "status": "cancelled",
+        "order_id": order.id,
+        "refund_amount": str(refund_amount),
+        "reversal_fee": "0.00",
+        "payment_method": order.payment_method,
+        "payment_status": order.payment_status,
+        "refund_method": "mua_wallet",
+    }
+
+
+
+# =========================================================
+# WALLET
+# =========================================================
+
+WALLET_ELIGIBLE_ROLES = [
+    "customer",
+    "shop_owner",
+    "admin",
+]
+
+
+def get_wallet_for_user(user):
+    """
+    Return the financial wallet for a customer,
+    shop owner, or admin.
+    """
+
+    if getattr(user, "role", None) not in WALLET_ELIGIBLE_ROLES:
+        raise ValueError(
+            "Your account is not eligible for a financial wallet."
+        )
+
+    wallet, created = Wallet.objects.get_or_create(
+        owner=user,
+    )
+
+    return wallet
+
+
+# =========================================================
+# PAYSTACK BANKS
+# =========================================================
+
+def get_paystack_banks():
+    """
+    Return active Nigerian banks supported by Paystack.
+    """
+
+    headers = _paystack_headers()
+
+    try:
+        response = requests.get(
+            "https://api.paystack.co/bank",
+            headers=headers,
+            params={
+                "country": "nigeria",
+                "currency": "NGN",
+                "perPage": 100,
+            },
+            timeout=20,
+        )
+    except requests.RequestException:
+        raise ValueError(
+            "Unable to connect to Paystack while loading banks."
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            "Paystack returned an invalid bank response."
+        )
+
+    if response.status_code != 200 or not data.get("status"):
+        raise ValueError(
+            data.get(
+                "message",
+                "Unable to load Nigerian banks.",
+            )
+        )
+
+    banks = []
+
+    for bank in data.get("data") or []:
+
+        if not bank.get("active"):
+            continue
+
+        banks.append(
+            {
+                "name": bank.get("name"),
+                "code": bank.get("code"),
+                "currency": bank.get("currency"),
+                "type": bank.get("type"),
+            }
+        )
+
+    return banks
+
+
+# =========================================================
+# BANK TRANSFER RECIPIENT
+# =========================================================
+
+def create_paystack_transfer_recipient_for_bank(
+    bank_account,
+):
+    """
+    Create a Paystack transfer recipient from a verified bank.
+    """
+
+    if not bank_account:
+        raise ValueError(
+            "A bank account is required."
+        )
+
+    if not bank_account.is_verified:
+        raise ValueError(
+            "The bank account must be verified before withdrawal."
+        )
+
+    headers = _paystack_headers()
+
+    payload = {
+        "type": "nuban",
+        "name": bank_account.account_name,
+        "account_number": bank_account.account_number,
+        "bank_code": bank_account.bank_code,
+        "currency": "NGN",
+    }
+
+    try:
+        response = requests.post(
+            "https://api.paystack.co/transferrecipient",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+    except requests.RequestException:
+        raise ValueError(
+            "Unable to connect to Paystack while creating the transfer recipient."
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            "Paystack returned an invalid recipient response."
+        )
+
+    if response.status_code not in (200, 201) or not data.get("status"):
+        raise ValueError(
+            data.get(
+                "message",
+                "Paystack could not create the transfer recipient.",
+            )
+        )
+
+    recipient_data = data.get("data") or {}
+
+    recipient_code = recipient_data.get(
+        "recipient_code"
+    )
+
+    if not recipient_code:
+        raise ValueError(
+            "Paystack did not return a transfer recipient code."
+        )
+
+    return recipient_code
+
+
+# =========================================================
+# CREATE WITHDRAWAL
+# =========================================================
+
+@transaction.atomic
+def create_withdrawal_request(
+    user,
+    bank_account_id,
+    amount,
+):
+    """
+    Reserve available wallet money and create a withdrawal.
+    """
+
+    if getattr(user, "role", None) not in WALLET_ELIGIBLE_ROLES:
+        raise ValueError(
+            "Your account is not eligible for withdrawals."
+        )
+
+    try:
+        amount = Decimal(str(amount))
+    except Exception:
+        raise ValueError(
+            "Invalid withdrawal amount."
+        )
+
+    if amount <= Decimal("0.00"):
+        raise ValueError(
+            "Withdrawal amount must be greater than zero."
+        )
+
+    bank_account = (
+        BankAccount.objects
+        .select_for_update()
+        .filter(
+            id=bank_account_id,
+            user=user,
+            is_verified=True,
+        )
+        .first()
+    )
+
+    if not bank_account:
+        raise ValueError(
+            "Verified bank account not found."
+        )
+
+    wallet = (
+        Wallet.objects
+        .select_for_update()
+        .filter(owner=user)
+        .first()
+    )
+
+    if not wallet:
+        wallet = Wallet.objects.create(
+            owner=user
+        )
+
+    if amount > wallet.available_balance:
+        raise ValueError(
+            "Insufficient available balance."
+        )
+
+    wallet.available_balance -= amount
+
+    wallet.save(
+        update_fields=[
+            "available_balance",
+            "updated_at",
+        ]
+    )
+
+    reference = (
+        "mua-withdrawal-"
+        + uuid.uuid4().hex
+    )
+
+    withdrawal = WithdrawalRequest.objects.create(
+        owner=user,
+        bank_account=bank_account,
+        amount=amount,
+        status="pending",
+        reference=reference,
+    )
+
+    FinancialTransaction.objects.create(
+        user=user,
+        transaction_type="withdrawal",
+        status="pending",
+        amount=amount,
+        reference=reference,
+        description=(
+            f"Withdrawal request to "
+            f"{bank_account.bank_name} "
+            f"account ending "
+            f"{bank_account.account_number[-4:]}"
+        ),
+    )
+
+    return withdrawal
+
+
+# =========================================================
+# INITIATE WITHDRAWAL
+# =========================================================
+
+@transaction.atomic
+def initiate_paystack_withdrawal(withdrawal):
+    """
+    Send an existing withdrawal request to Paystack.
+    """
+
+    withdrawal = (
+        WithdrawalRequest.objects
+        .select_for_update()
+        .select_related(
+            "owner",
+            "bank_account",
+        )
+        .get(pk=withdrawal.pk)
+    )
+
+    if withdrawal.status != "pending":
+        raise ValueError(
+            "This withdrawal cannot be initiated."
+        )
+
+    if not withdrawal.bank_account.is_verified:
+        raise ValueError(
+            "The withdrawal bank account is not verified."
+        )
+
+    if withdrawal.provider_reference:
+        raise ValueError(
+            "This withdrawal has already been sent to Paystack."
+        )
+
+    recipient_code = (
+        create_paystack_transfer_recipient_for_bank(
+            withdrawal.bank_account
+        )
+    )
+
+    amount_kobo = int(
+        withdrawal.amount * Decimal("100")
+    )
+
+    headers = _paystack_headers()
+
+    payload = {
+        "source": "balance",
+        "amount": amount_kobo,
+        "recipient": recipient_code,
+        "reference": withdrawal.reference,
+        "reason": (
+            f"MUA Shopping wallet withdrawal "
+            f"for {withdrawal.owner.username}"
+        ),
+        "currency": "NGN",
+    }
+
+    try:
+        response = requests.post(
+            "https://api.paystack.co/transfer",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+    except requests.RequestException:
+        raise ValueError(
+            "Unable to connect to Paystack while initiating the withdrawal."
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            "Paystack returned an invalid transfer response."
+        )
+
+    if response.status_code not in (200, 201) or not data.get("status"):
+        raise ValueError(
+            data.get(
+                "message",
+                "Paystack could not initiate the withdrawal.",
+            )
+        )
+
+    transfer_data = data.get("data") or {}
+
+    provider_reference = (
+        transfer_data.get("reference")
+        or withdrawal.reference
+    )
+
+    transfer_status = (
+        transfer_data.get("status")
+        or "pending"
+    ).lower()
+
+    withdrawal.provider_reference = provider_reference
+
+    if transfer_status in [
+        "success",
+        "successful",
+    ]:
+
+        withdrawal.status = "completed"
+        withdrawal.completed_at = timezone.now()
+
+    elif transfer_status in [
+        "failed",
+        "reversed",
+    ]:
+
+        withdrawal.status = "failed"
+
+        withdrawal.failure_reason = (
+            transfer_data.get("reason")
+            or transfer_data.get("failures")
+            or "Paystack transfer failed."
+        )
+
+    else:
+        withdrawal.status = "processing"
+
+    withdrawal.save(
+        update_fields=[
+            "provider_reference",
+            "status",
+            "failure_reason",
+            "completed_at",
+            "updated_at",
+        ]
+    )
+
+    transaction_record = (
+        FinancialTransaction.objects
+        .select_for_update()
+        .filter(
+            reference=withdrawal.reference,
+            transaction_type="withdrawal",
+        )
+        .first()
+    )
+
+    if transaction_record:
+
+        if withdrawal.status == "completed":
+            transaction_record.status = "completed"
+
+        elif withdrawal.status == "failed":
+
+            transaction_record.status = "failed"
+
+            transaction_record.description = (
+                f"{transaction_record.description}\n"
+                f"Paystack failure: "
+                f"{withdrawal.failure_reason}"
+            )
+
+        transaction_record.save(
+            update_fields=[
+                "status",
+                "description",
+                "updated_at",
+            ]
+        )
+
+    if withdrawal.status == "failed":
+
+        wallet = (
+            Wallet.objects
+            .select_for_update()
+            .get(owner=withdrawal.owner)
+        )
+
+        wallet.available_balance += withdrawal.amount
+
+        wallet.save(
+            update_fields=[
+                "available_balance",
+                "updated_at",
+            ]
+        )
+
+    return withdrawal
+
+
+# =========================================================
+# VERIFY WITHDRAWAL
+# =========================================================
+
+@transaction.atomic
+def verify_paystack_withdrawal(withdrawal):
+    """
+    Verify an already initiated withdrawal.
+    """
+
+    withdrawal = (
+        WithdrawalRequest.objects
+        .select_for_update()
+        .select_related(
+            "owner",
+            "bank_account",
+        )
+        .get(pk=withdrawal.pk)
+    )
+
+    if not withdrawal.provider_reference:
+        raise ValueError(
+            "This withdrawal has not been sent to Paystack."
+        )
+
+    if withdrawal.status in [
+        "completed",
+        "failed",
+    ]:
+        return withdrawal
+
+    headers = _paystack_headers()
+
+    try:
+        response = requests.get(
+            "https://api.paystack.co/transfer/verify/"
+            f"{withdrawal.provider_reference}",
+            headers=headers,
+            timeout=20,
+        )
+    except requests.RequestException:
+        raise ValueError(
+            "Unable to connect to Paystack while verifying the withdrawal."
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            "Paystack returned an invalid verification response."
+        )
+
+    if response.status_code != 200 or not data.get("status"):
+        raise ValueError(
+            data.get(
+                "message",
+                "Paystack could not verify the withdrawal.",
+            )
+        )
+
+    transfer_data = data.get("data") or {}
+
+    transfer_status = (
+        transfer_data.get("status") or ""
+    ).lower()
+
+    transaction_record = (
+        FinancialTransaction.objects
+        .select_for_update()
+        .filter(
+            reference=withdrawal.reference,
+            transaction_type="withdrawal",
+        )
+        .first()
+    )
+
+    if transfer_status == "success":
+
+        withdrawal.status = "completed"
+        withdrawal.failure_reason = ""
+        withdrawal.completed_at = timezone.now()
+
+        withdrawal.save(
+            update_fields=[
+                "status",
+                "failure_reason",
+                "completed_at",
+                "updated_at",
+            ]
+        )
+
+        if transaction_record:
+
+            transaction_record.status = "completed"
+
+            transaction_record.save(
+                update_fields=[
+                    "status",
+                    "updated_at",
+                ]
+            )
+
+        return withdrawal
+
+    if transfer_status in [
+        "failed",
+        "reversed",
+    ]:
+
+        reason = (
+            transfer_data.get("failures")
+            or transfer_data.get("reason")
+            or "Paystack transfer failed."
+        )
+
+        wallet = (
+            Wallet.objects
+            .select_for_update()
+            .get(owner=withdrawal.owner)
+        )
+
+        wallet.available_balance += withdrawal.amount
+
+        wallet.save(
+            update_fields=[
+                "available_balance",
+                "updated_at",
+            ]
+        )
+
+        withdrawal.status = "failed"
+        withdrawal.failure_reason = str(reason)
+
+        withdrawal.save(
+            update_fields=[
+                "status",
+                "failure_reason",
+                "updated_at",
+            ]
+        )
+
+        if transaction_record:
+
+            transaction_record.status = "failed"
+
+            transaction_record.description = (
+                f"{transaction_record.description}\n"
+                f"Paystack transfer {transfer_status}: "
+                f"{reason}\n"
+                f"Wallet balance restored: "
+                f"₦{withdrawal.amount}."
+            )
+
+            transaction_record.save(
+                update_fields=[
+                    "status",
+                    "description",
+                    "updated_at",
+                ]
+            )
+
+        return withdrawal
+
+    withdrawal.status = "processing"
+
+    withdrawal.save(
+        update_fields=[
+            "status",
+            "updated_at",
+        ]
+    )
+
+    return withdrawal
+
+
+# =========================================================
+# WALLET DEPOSITS
+# =========================================================
+
+def create_wallet_deposit(user, amount):
+    """
+    Create a pending wallet deposit.
+
+    Wallet is credited only after Paystack verification.
+    """
+
+    if getattr(user, "role", None) not in WALLET_ELIGIBLE_ROLES:
+        raise ValueError(
+            "Your account is not eligible for wallet deposits."
+        )
+
+    try:
+        amount = Decimal(str(amount))
+    except Exception:
+        raise ValueError(
+            "Invalid deposit amount."
+        )
+
+    if amount <= Decimal("0.00"):
+        raise ValueError(
+            "Deposit amount must be greater than zero."
+        )
+
+    reference = (
+        "mua-deposit-"
+        + uuid.uuid4().hex
+    )
+
+    deposit = WalletDeposit.objects.create(
+        user=user,
+        amount=amount,
+        reference=reference,
+        status="pending",
+    )
+
+    return deposit
+
+
+# =========================================================
+# INITIALIZE WALLET DEPOSIT
+# =========================================================
+
+@transaction.atomic
+def initialize_wallet_deposit(deposit, payment_method="card"):
+    """
+    Initialize a wallet deposit through Paystack.
+
+    payment_method:
+        card -> Paystack card checkout
+        ussd -> Paystack USSD payment
+    """
+
+    if payment_method not in {"card", "ussd"}:
+        raise ValueError(
+            "Unsupported payment method. Choose card or ussd."
+        )
+
+    deposit = (
+        WalletDeposit.objects
+        .select_for_update()
+        .select_related("user")
+        .get(pk=deposit.pk)
+    )
+
+    if deposit.status != "pending":
+        raise ValueError(
+            "This deposit is no longer pending."
+        )
+
+    headers = _paystack_headers()
+
+    email = (deposit.user.email or "").strip()
+
+    if not email:
+        raise ValueError(
+            "Your account must have an email address before making a deposit."
+        )
+
+    amount_kobo = int(
+        deposit.amount * Decimal("100")
+    )
+
+    payload = {
+        "email": email,
+        "amount": amount_kobo,
+        "reference": deposit.reference,
+        "currency": "NGN",
+        "channels": [payment_method],
+        "metadata": {
+            "type": "wallet_deposit",
+            "deposit_id": deposit.id,
+            "user_id": deposit.user.id,
+            "payment_method": payment_method,
+        },
+    }
+
+    try:
+        response = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+    except requests.RequestException:
+        raise ValueError(
+            "Unable to connect to Paystack while initializing the deposit."
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            "Paystack returned an invalid initialization response."
+        )
+
+    if response.status_code != 200 or not data.get("status"):
+        raise ValueError(
+            data.get(
+                "message",
+                "Paystack could not initialize the deposit.",
+            )
+        )
+
+    transaction_data = data.get("data") or {}
+
+    authorization_url = transaction_data.get(
+        "authorization_url"
+    )
+
+    access_code = transaction_data.get(
+        "access_code"
+    )
+
+    provider_reference = transaction_data.get(
+        "reference"
+    )
+
+    if not authorization_url:
+        raise ValueError(
+            "Paystack did not return a payment URL."
+        )
+
+    deposit.provider_reference = (
+        provider_reference or deposit.reference
+    )
+
+    deposit.save(
+        update_fields=[
+            "provider_reference",
+            "updated_at",
+        ]
+    )
+
+    return {
+        "deposit": deposit,
+        "authorization_url": authorization_url,
+        "access_code": access_code,
+        "reference": deposit.reference,
+    }
+
+
+# =========================================================
+# VERIFY WALLET DEPOSIT
+# =========================================================
+
+@transaction.atomic
+def verify_wallet_deposit(deposit):
+    """
+    Verify wallet deposit with Paystack.
+
+    The wallet is credited exactly once.
+    """
+
+    deposit = (
+        WalletDeposit.objects
+        .select_for_update()
+        .select_related("user")
+        .get(pk=deposit.pk)
+    )
+
+    if deposit.status == "completed":
+        return deposit
+
+    if deposit.status == "failed":
+        return deposit
+
+    reference = (
+        deposit.provider_reference
+        or deposit.reference
+    )
+
+    headers = _paystack_headers()
+
+    try:
+        response = requests.get(
+            "https://api.paystack.co/transaction/verify/"
+            f"{reference}",
+            headers=headers,
+            timeout=20,
+        )
+    except requests.RequestException:
+        raise ValueError(
+            "Unable to connect to Paystack while verifying the deposit."
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            "Paystack returned an invalid verification response."
+        )
+
+    if response.status_code != 200 or not data.get("status"):
+        raise ValueError(
+            data.get(
+                "message",
+                "Paystack could not verify the deposit.",
+            )
+        )
+
+    transaction_data = data.get("data") or {}
+
+    payment_status = (
+        transaction_data.get("status") or ""
+    ).lower()
+
+    paystack_reference = (
+        transaction_data.get("reference") or ""
+    )
+
+    if paystack_reference != reference:
+        raise ValueError(
+            "Paystack reference does not match the wallet deposit."
+        )
+
+    expected_amount = int(
+        deposit.amount * Decimal("100")
+    )
+
+    actual_amount = transaction_data.get("amount")
+
+    if actual_amount != expected_amount:
+        raise ValueError(
+            "The Paystack deposit amount does not match the requested amount."
+        )
+
+    if payment_status == "success":
+
+        wallet = (
+            Wallet.objects
+            .select_for_update()
+            .get_or_create(
+                owner=deposit.user
+            )[0]
+        )
+
+        wallet.available_balance += deposit.amount
+
+        wallet.save(
+            update_fields=[
+                "available_balance",
+                "updated_at",
+            ]
+        )
+
+        deposit.status = "completed"
+        deposit.completed_at = timezone.now()
+        deposit.failure_reason = ""
+
+        deposit.save(
+            update_fields=[
+                "status",
+                "completed_at",
+                "failure_reason",
+                "updated_at",
+            ]
+        )
+
+        FinancialTransaction.objects.get_or_create(
+            reference=deposit.reference,
+            defaults={
+                "user": deposit.user,
+                "transaction_type": "deposit",
+                "status": "completed",
+                "amount": deposit.amount,
+                "description": (
+                    "Wallet deposit through Paystack."
+                ),
+            },
+        )
+
+        return deposit
+
+    if payment_status in [
+        "failed",
+        "abandoned",
+    ]:
+
+        deposit.status = "failed"
+
+        deposit.failure_reason = (
+            transaction_data.get("gateway_response")
+            or transaction_data.get("message")
+            or "Paystack payment failed."
+        )
+
+        deposit.save(
+            update_fields=[
+                "status",
+                "failure_reason",
+                "updated_at",
+            ]
+        )
+
+        FinancialTransaction.objects.get_or_create(
+            reference=deposit.reference,
+            defaults={
+                "user": deposit.user,
+                "transaction_type": "deposit",
+                "status": "failed",
+                "amount": deposit.amount,
+                "description": (
+                    "Wallet deposit failed through Paystack."
+                ),
+            },
+        )
+
+        return deposit
+
+    return deposit

@@ -1,0 +1,134 @@
+from django.urls import path
+
+from .views import (
+    InitializePaystackPaymentView,
+    VerifyPaystackPaymentView,
+    CreateRefundRequestView,
+    SendRefundOfferView,
+    RefundResponseView,
+    CustomerBankAccountListCreateView,
+    VerifyBankAccountView,
+    ProcessRefundPaymentView,
+    InitiatePaystackRefundView,
+    VerifyPaystackRefundView,
+    paystack_webhook,
+    WalletView,
+    CreateWalletDepositView,
+InitializeWalletDepositView,
+VerifyWalletDepositView,
+WalletOrderPaymentView,
+PaystackBanksView,
+CreateWithdrawalView,
+VerifyWithdrawalView,
+WithdrawalListView,
+)
+
+urlpatterns = [
+    path(
+        "refunds/",
+        CreateRefundRequestView.as_view(),
+        name="create-refund-request",
+    ),
+
+    path(
+        "refunds/<int:pk>/offer/",
+        SendRefundOfferView.as_view(),
+        name="send-refund-offer",
+    ),
+
+    path(
+        "refunds/<int:pk>/response/",
+        RefundResponseView.as_view(),
+        name="refund-response",
+    ),
+
+    path(
+        "bank-accounts/",
+        CustomerBankAccountListCreateView.as_view(),
+        name="customer-bank-accounts",
+    ),
+
+    path(
+        "bank-accounts/verify/",
+        VerifyBankAccountView.as_view(),
+        name="verify-bank-account",
+    ),
+    path(
+        "refunds/<int:pk>/process/",
+        ProcessRefundPaymentView.as_view(),
+        name="process-refund-payment",
+    ),
+    path(
+        "refunds/<int:pk>/initiate-paystack-refund/",
+        InitiatePaystackRefundView.as_view(),
+        name="initiate-paystack-refund",
+    ),
+    path(
+        "refunds/<int:pk>/verify-paystack-refund/",
+        VerifyPaystackRefundView.as_view(),
+        name="verify-paystack-refund",
+    ),
+    path(
+        "paystack-webhook/",
+        paystack_webhook,
+        name="paystack-webhook",
+    ),
+    path(
+    "orders/<int:pk>/initialize/",
+    InitializePaystackPaymentView.as_view(),
+    name="initialize-paystack-payment",
+),
+path(
+    "orders/<int:pk>/verify/",
+    VerifyPaystackPaymentView.as_view(),
+    name="verify-paystack-payment",
+),
+path(
+    "orders/<int:pk>/wallet-pay/",
+    WalletOrderPaymentView.as_view(),
+    name="wallet-order-payment",
+),
+    path(
+        "wallet/",
+        WalletView.as_view(),
+        name="wallet",
+    ),
+
+    path(
+        "wallet/banks/",
+        PaystackBanksView.as_view(),
+        name="wallet-banks",
+    ),
+    path(
+    "wallet/deposits/",
+    CreateWalletDepositView.as_view(),
+    name="create-wallet-deposit",
+),
+path(
+    "wallet/deposits/<int:pk>/initialize/",
+    InitializeWalletDepositView.as_view(),
+    name="initialize-wallet-deposit",
+),
+path(
+    "wallet/deposits/<int:pk>/verify/",
+    VerifyWalletDepositView.as_view(),
+    name="verify-wallet-deposit",
+),
+    path(
+        "wallet/withdrawals/",
+        CreateWithdrawalView.as_view(),
+        name="create-withdrawal",
+    ),
+
+    path(
+        "wallet/withdrawals/history/",
+        WithdrawalListView.as_view(),
+        name="withdrawal-history",
+    ),
+
+    path(
+        "wallet/withdrawals/<int:pk>/verify/",
+        VerifyWithdrawalView.as_view(),
+        name="verify-withdrawal",
+    ),
+]

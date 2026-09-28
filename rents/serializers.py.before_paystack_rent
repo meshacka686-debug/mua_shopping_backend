@@ -1,0 +1,180 @@
+from rest_framework import serializers
+
+from .models import Rent, RentBooking
+
+
+class RentSerializer(serializers.ModelSerializer):
+    owner_id = serializers.IntegerField(
+        source="owner.id",
+        read_only=True,
+    )
+
+    owner_name = serializers.CharField(
+        source="owner.username",
+        read_only=True,
+    )
+
+    images = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Rent
+        fields = [
+            "id",
+            "owner_id",
+            "owner_name",
+            "owner_phone",
+            "title",
+            "description",
+            "location",
+            "price",
+            "price_period",
+            "quantity",
+            "images",
+            "video",
+            "is_available",
+            "created_at",
+            "updated_at",
+        ]
+
+        read_only_fields = [
+            "id",
+            "owner_id",
+            "owner_name",
+            "images",
+            "created_at",
+            "updated_at",
+        ]
+
+    def _media_url(self, value):
+        if not value:
+            return ""
+
+        request = self.context.get("request")
+        url = value.url
+
+        if request:
+            return request.build_absolute_uri(url)
+
+        return url
+
+    def get_images(self, obj):
+        return [
+            self._media_url(item.image)
+            for item in obj.images.all()
+        ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+
+        data["video"] = self._media_url(instance.video)
+
+        return data
+
+
+class RentBookingSerializer(serializers.ModelSerializer):
+    rent_id = serializers.IntegerField(source="rent.id", read_only=True)
+    rent_title = serializers.CharField(source="rent.title", read_only=True)
+    rent_location = serializers.CharField(source="rent.location", read_only=True)
+    rent_description = serializers.CharField(
+        source="rent.description",
+        read_only=True,
+    )
+    rent_price = serializers.DecimalField(
+        source="rent.price",
+        max_digits=14,
+        decimal_places=2,
+        read_only=True,
+    )
+    rent_price_period = serializers.CharField(
+        source="rent.price_period",
+        read_only=True,
+    )
+
+    customer_id = serializers.IntegerField(
+        source="customer.id",
+        read_only=True,
+    )
+    customer_name = serializers.CharField(
+        source="customer.username",
+        read_only=True,
+    )
+
+    customer_phone = serializers.CharField(
+        source="customer.phone",
+        read_only=True,
+    )
+
+    owner_id = serializers.IntegerField(
+        source="rent.owner.id",
+        read_only=True,
+    )
+    owner_name = serializers.CharField(
+        source="rent.owner.username",
+        read_only=True,
+    )
+
+    rent_image = serializers.SerializerMethodField()
+    rent_video = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RentBooking
+        fields = [
+            "id",
+            "rent_id",
+            "rent_title",
+            "rent_location",
+            "rent_description",
+            "rent_price",
+            "rent_price_period",
+            "rent_image",
+            "rent_video",
+            "customer_id",
+            "customer_name",
+            "customer_phone",
+            "owner_id",
+            "owner_name",
+            "amount",
+            "status",
+            "owner_confirmed_at",
+            "owner_rejected_at",
+            "owner_cancelled_at",
+            "customer_cancelled_at",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def _media_url(self, obj, field_name):
+        value = getattr(obj.rent, field_name)
+        if not value:
+            return ""
+
+        request = self.context.get("request")
+        url = value.url
+
+        if request:
+            return request.build_absolute_uri(url)
+
+        return url
+
+    def get_rent_image(self, obj):
+        # Prefer the main rent image.
+        if obj.rent.image:
+            return self._media_url(obj, "image")
+
+        # If the main image is empty, use the first uploaded RentImage.
+        first_image = obj.rent.images.first()
+        if first_image and first_image.image:
+            request = self.context.get("request")
+            url = first_image.image.url
+
+            if request:
+                return request.build_absolute_uri(url)
+
+            return url
+
+        return ""
+
+    def get_rent_video(self, obj):
+        return self._media_url(obj, "video")

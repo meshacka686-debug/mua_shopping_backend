@@ -1,0 +1,81 @@
+from decimal import Decimal
+
+from django.db import transaction
+
+from .models import (
+    AdminCommission,
+    FinancialTransaction,
+ 
+    Wallet,
+)
+
+
+COMMISSION_PER_UNIT = Decimal("500.00")
+
+
+@transaction.atomic
+def create_sale_financial_records(order):
+    """
+    Create pending financial records for a completed order.
+
+    Admin commission:
+        ₦500 × quantity
+
+    Shop owner earnings:
+        Product sale amount - admin commission
+    """
+
+    for item in order.items.select_related("product__shop__owner").all():
+        product = item.product
+        shop = product.shop
+        owner = shop.owner
+
+        sale_amount = item.price * item.quantity
+        commission_amount = (
+            COMMISSION_PER_UNIT * item.quantity
+        )
+
+        owner_earning = sale_amount - commission_amount
+
+        if owner_earning < Decimal("0.00"):
+            owner_earning = Decimal("0.00")
+
+        wallet, created = Wallet.objects.get_or_create(
+            owner=owner
+        )
+
+        commission, commission_created = (
+            AdminCommission.objects.get_or_create(
+                order_item=item,
+                defaults={
+                    "order": order,
+                    "shop": shop,
+                    "quantity": item.quantity,
+                    "amount_per_unit": COMMISSION_PER_UNIT,
+                    "total_amount": commission_amount,
+                },
+            )
+        )
+
+        if commission_created:
+            FinancialTransaction.objects.create(
+                user=owner,
+                transaction_type="commission",
+                status="completed",
+                amount=commission_amount,
+                reference=f"COMMISSION-{order.id}-{item.id}",
+                description=(
+                    f"Admin commission for "
+                    f"{item.product.name}"
+                ),
+                order=order,
+            )
+
+        sale_reference = f"SALE-{order.id}-{item.id}"
+
+        sale_transaction, sale_created = (
+            FinancialTransaction.objects.get_or_create(
+                reference=sale_reference,
+                defaults={
+                    "user": owner,
+                    "transaction_type": "sale_pending

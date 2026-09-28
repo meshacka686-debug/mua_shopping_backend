@@ -1,0 +1,515 @@
+from decimal import Decimal
+
+from django.conf import settings
+from django.db import models
+
+
+class Wallet(models.Model):
+    """
+    Financial wallet belonging to a shop owner.
+
+    pending_balance:
+        Money earned from completed sales but not yet released.
+
+    available_balance:
+        Money released to the shop owner and available for withdrawal.
+    """
+    owner = models.OneToOneField(
+    settings.AUTH_USER_MODEL,
+    on_delete=models.CASCADE,
+    related_name="financial_wallet",
+    limit_choices_to={"role__in": ["customer", "shop_owner", "admin"]},
+)
+    pending_balance = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+
+    available_balance = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+
+    held_balance = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True
+    )
+
+    def __str__(self):
+        return f"Wallet - {self.owner.username}"
+
+
+class BankAccount(models.Model):
+    """
+    Bank account saved by a customer or shop owner.
+
+    The actual account-name verification must be performed
+    by the configured payment provider.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="bank_accounts",
+    )
+
+    bank_code = models.CharField(
+        max_length=20
+    )
+
+    bank_name = models.CharField(
+        max_length=150
+    )
+
+    account_number = models.CharField(
+        max_length=30
+    )
+
+    account_name = models.CharField(
+        max_length=200
+    )
+
+    is_verified = models.BooleanField(
+        default=False
+    )
+
+    is_default = models.BooleanField(
+        default=False
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True
+    )
+
+    class Meta:
+        ordering = ["-is_default", "-created_at"]
+
+    def __str__(self):
+        return (
+            f"{self.bank_name} - "
+            f"{self.account_number}"
+        )
+
+
+class FinancialTransaction(models.Model):
+    """
+    Immutable-style ledger entry describing a financial event.
+
+    The ledger is the source of truth for financial movements.
+    """
+    TYPE_CHOICES = [
+             ("sale_pending", "Sale Pending"),
+             ("sale_released", "Sale Released"),
+             ("commission", "Admin Commission"),
+             ("refund", "Customer Refund"),
+             ("deposit", "Wallet Deposit"),
+             ("withdrawal", "Shop Owner Withdrawal"),
+             ("refund_reversal", "Refund Reversal"),
+             ("withdrawal_reversal", "Withdrawal Reversal"),
+             ("purchase_hold", "Purchase Held"),
+             ("purchase_refund", "Purchase Refund"),
+            ("adjustment", "Financial Adjustment"),
+    ]
+
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("completed", "Completed"),
+        ("failed", "Failed"),
+        ("reversed", "Reversed"),
+    ]
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="financial_transactions",
+    )
+
+    transaction_type = models.CharField(
+        max_length=30,
+        choices=TYPE_CHOICES,
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="pending",
+    )
+
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+    )
+
+    reference = models.CharField(
+        max_length=100,
+        unique=True,
+    )
+
+    description = models.TextField(
+        blank=True
+    )
+
+    order = models.ForeignKey(
+        "orders.Order",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="financial_transactions",
+    )
+
+    refund_request = models.ForeignKey(
+    "payments.RefundRequest",
+    on_delete=models.SET_NULL,
+    null=True,
+    blank=True,
+    related_name="financial_transactions",
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return (
+            f"{self.transaction_type} - "
+            f"{self.reference}"
+        )
+
+
+class AdminCommission(models.Model):
+    """
+    Records the fixed commission charged by the platform.
+
+    Current business rule:
+        ₦500 for every product unit sold.
+    """
+
+    COMMISSION_PER_UNIT = Decimal("500.00")
+
+    order = models.ForeignKey(
+        "orders.Order",
+        on_delete=models.CASCADE,
+        related_name="admin_commissions",
+    )
+
+    shop = models.ForeignKey(
+        "shops.Shop",
+        on_delete=models.CASCADE,
+        related_name="admin_commissions",
+    )
+
+    order_item = models.ForeignKey(
+        "orders.OrderItem",
+        on_delete=models.CASCADE,
+        related_name="admin_commissions",
+    )
+
+    quantity = models.PositiveIntegerField()
+
+    amount_per_unit = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=COMMISSION_PER_UNIT,
+    )
+
+    total_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=[
+                    "order_item",
+                ],
+                name="unique_commission_per_order_item",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"Commission #{self.id} - "
+            f"₦{self.total_amount}"
+        )
+
+
+class RefundRequest(models.Model):
+    """
+    Customer refund/dispute request for a delivered order.
+    """
+
+    STATUS_CHOICES = [
+        ("requested", "Requested"),
+        ("offer_sent", "Offer Sent"),
+        ("accepted", "Accepted"),
+        ("rejected", "Rejected"),
+        ("receiving_product", "Receiving Product"),
+        ("disputed", "Disputed"),
+        ("processing", "Processing"),
+        ("paid", "Paid"),
+        ("cancelled", "Cancelled"),
+        ("failed", "Failed"),
+    ]
+
+    paystack_recipient_code = models.CharField(
+      max_length=100,
+      blank=True,
+    )
+
+    payout_failure_reason = models.TextField(
+    blank=True,
+    )
+
+    reserved_pending_amount = models.DecimalField(
+    max_digits=14,
+    decimal_places=2,
+    default=Decimal("0.00"),
+   )
+
+    reserved_available_amount = models.DecimalField(
+    max_digits=14,
+    decimal_places=2,
+    default=Decimal("0.00"),
+    )
+    order = models.ForeignKey(
+    "orders.Order",
+    on_delete=models.CASCADE,
+    related_name="refund_requests",
+    )
+
+    customer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="refund_requests",
+    )
+
+    shop = models.ForeignKey(
+        "shops.Shop",
+        on_delete=models.CASCADE,
+        related_name="refund_requests",
+    )
+
+    reason = models.TextField()
+
+    status = models.CharField(
+        max_length=30,
+        choices=STATUS_CHOICES,
+        default="requested",
+    )
+
+    requested_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+    )
+
+    delivery_fee = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+
+    offered_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+
+    shop_note = models.TextField(
+        blank=True
+    )
+
+    customer_note = models.TextField(
+        blank=True
+    )
+
+    bank_account = models.ForeignKey(
+        BankAccount,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="refund_requests",
+    )
+
+    payout_reference = models.CharField(
+        max_length=100,
+        blank=True,
+    )
+
+    paid_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True
+    )
+
+    def __str__(self):
+        return (
+            f"Refund #{self.id} - "
+            f"Order #{self.order_id}"
+        )
+
+
+class WithdrawalRequest(models.Model):
+    """
+    Shop owner's request to withdraw available wallet funds.
+    """
+
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("processing", "Processing"),
+        ("completed", "Completed"),
+        ("failed", "Failed"),
+        ("reversed", "Reversed"),
+    ]
+
+    owner = models.ForeignKey(
+    settings.AUTH_USER_MODEL,
+    on_delete=models.CASCADE,
+    related_name="withdrawal_requests",
+    limit_choices_to={"role__in": ["customer", "shop_owner", "admin"]},
+)
+
+    bank_account = models.ForeignKey(
+        BankAccount,
+        on_delete=models.PROTECT,
+        related_name="withdrawals",
+    )
+
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="pending",
+    )
+
+    reference = models.CharField(
+        max_length=100,
+        unique=True,
+    )
+
+    provider_reference = models.CharField(
+        max_length=150,
+        blank=True,
+    )
+
+    failure_reason = models.TextField(
+        blank=True
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True
+    )
+
+    completed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    def __str__(self):
+        return (
+            f"Withdrawal #{self.id} - "
+            f"{self.owner.username}"
+        )
+    
+class WalletDeposit(models.Model):
+    """
+    Paystack deposit into a user's wallet.
+    """
+
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("completed", "Completed"),
+        ("failed", "Failed"),
+    ]
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="wallet_deposits",
+    )
+
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+    )
+
+    reference = models.CharField(
+        max_length=100,
+        unique=True,
+    )
+
+    provider_reference = models.CharField(
+        max_length=150,
+        blank=True,
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="pending",
+    )
+
+    failure_reason = models.TextField(
+        blank=True,
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True,
+    )
+
+    completed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    def __str__(self):
+        return (
+            f"Wallet Deposit #{self.id} - "
+            f"{self.user.username}"
+        )

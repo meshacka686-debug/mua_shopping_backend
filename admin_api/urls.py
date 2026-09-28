@@ -1,0 +1,142 @@
+from django.urls import path
+
+from .views import (
+    AdminDashboardView,
+    AdminCommissionHistoryView,
+    AdminCustomersView,
+    AdminCustomerDetailView,
+    AdminCustomerStatusView,
+    AdminCustomerOrdersView,
+    AdminShopsView,
+    AdminShopDetailView,
+    AdminShopStatusView,
+    AdminShopProductsView,
+    AdminShopOrdersView,
+    AdminShopOwnersView,
+    AdminCreateShopOwnerView,
+    AdminShopOwnerDetailView,
+    AdminShopOwnerStatusView,
+    AdminShopOwnerProductsView,
+    AdminShopOwnerOrdersView,
+)
+
+
+
+urlpatterns = [
+    # ============================================================
+    # DASHBOARD
+    # ============================================================
+
+    path(
+        "dashboard/",
+        AdminDashboardView.as_view(),
+        name="admin-dashboard",
+    ),
+
+    path(
+        "commission-history/",
+        AdminCommissionHistoryView.as_view(),
+        name="admin-commission-history",
+    ),
+
+    # ============================================================
+    # CUSTOMERS
+    # ============================================================
+
+    path(
+        "customers/",
+        AdminCustomersView.as_view(),
+        name="admin-customers",
+    ),
+
+    path(
+        "customers/<int:pk>/",
+        AdminCustomerDetailView.as_view(),
+        name="admin-customer-detail",
+    ),
+
+    path(
+        "customers/<int:pk>/status/",
+        AdminCustomerStatusView.as_view(),
+        name="admin-customer-status",
+    ),
+
+    path(
+        "customers/<int:pk>/orders/",
+        AdminCustomerOrdersView.as_view(),
+        name="admin-customer-orders",
+    ),
+
+    # ============================================================
+    # SHOPS
+    # ============================================================
+
+    path(
+        "shops/",
+        AdminShopsView.as_view(),
+        name="admin-shops",
+    ),
+
+    path(
+        "shops/<int:pk>/",
+        AdminShopDetailView.as_view(),
+        name="admin-shop-detail",
+    ),
+
+    path(
+        "shops/<int:pk>/status/",
+        AdminShopStatusView.as_view(),
+        name="admin-shop-status",
+    ),
+
+    path(
+        "shops/<int:pk>/products/",
+        AdminShopProductsView.as_view(),
+        name="admin-shop-products",
+    ),
+
+    path(
+        "shops/<int:pk>/orders/",
+        AdminShopOrdersView.as_view(),
+        name="admin-shop-orders",
+    ),
+
+        # ============================================================
+    # SHOP OWNERS
+    # ============================================================
+
+    path(
+        "shop-owners/",
+        AdminShopOwnersView.as_view(),
+        name="admin-shop-owners",
+    ),
+    path(
+    "shop-owners/create/",
+    AdminCreateShopOwnerView.as_view(),
+    name="admin-create-shop-owner",
+),
+
+    path(
+        "shop-owners/<int:pk>/",
+        AdminShopOwnerDetailView.as_view(),
+        name="admin-shop-owner-detail",
+    ),
+
+    path(
+        "shop-owners/<int:pk>/status/",
+        AdminShopOwnerStatusView.as_view(),
+        name="admin-shop-owner-status",
+    ),
+
+    path(
+        "shop-owners/<int:pk>/products/",
+        AdminShopOwnerProductsView.as_view(),
+        name="admin-shop-owner-products",
+    ),
+
+    path(
+        "shop-owners/<int:pk>/orders/",
+        AdminShopOwnerOrdersView.as_view(),
+        name="admin-shop-owner-orders",
+    ),
+]

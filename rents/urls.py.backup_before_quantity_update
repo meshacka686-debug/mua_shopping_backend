@@ -1,0 +1,56 @@
+from django.urls import path
+
+from .views import (
+    CustomerCancelRentBookingView,
+    CustomerConfirmRentBookingView,
+    ConfirmRentBookingView,
+    MyRentBookingsView,
+    OwnerRentBookingsView,
+    RejectRentBookingView,
+    RentBookView,
+    RentDetailView,
+    RentListCreateView,
+)
+
+urlpatterns = [
+    path("", RentListCreateView.as_view(), name="rent-list-create"),
+    path("<int:pk>/", RentDetailView.as_view(), name="rent-detail"),
+
+    path(
+        "<int:pk>/book/",
+        RentBookView.as_view(),
+        name="rent-book",
+    ),
+
+    path(
+        "bookings/my/",
+        MyRentBookingsView.as_view(),
+        name="my-rent-bookings",
+    ),
+    path(
+        "bookings/owner/",
+        OwnerRentBookingsView.as_view(),
+        name="owner-rent-bookings",
+    ),
+
+    path(
+        "bookings/<int:pk>/confirm/",
+        ConfirmRentBookingView.as_view(),
+        name="rent-booking-confirm",
+    ),
+    path(
+        "bookings/<int:pk>/reject/",
+        RejectRentBookingView.as_view(),
+        name="rent-booking-reject",
+    ),
+    path(
+        "bookings/<int:pk>/customer-confirm/",
+        CustomerConfirmRentBookingView.as_view(),
+        name="rent-booking-customer-confirm",
+    ),
+    path(
+        "bookings/<int:pk>/customer-cancel/",
+        CustomerCancelRentBookingView.as_view(),
+        name="rent-booking-customer-cancel",
+    ),
+]
