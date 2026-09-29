@@ -1,3 +1,4 @@
+from config.cloudinary_storages import CloudinaryImageStorage, CloudinaryVideoStorage
 from django.db import models
 
 
@@ -28,12 +29,14 @@ class Product(models.Model):
         upload_to="products/images/",
         blank=True,
         null=True,
+        storage=CloudinaryImageStorage(),
     )
 
     video = models.FileField(
         upload_to="products/videos/",
         blank=True,
         null=True,
+        storage=CloudinaryVideoStorage(),
     )
 
     is_available = models.BooleanField(default=True)

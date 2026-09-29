@@ -1,3 +1,4 @@
+from config.cloudinary_storages import CloudinaryImageStorage, CloudinaryVideoStorage
 from django.conf import settings
 from django.db import models
 
@@ -15,12 +16,14 @@ class SocialPost(models.Model):
         upload_to="social/images/",
         blank=True,
         null=True,
+        storage=CloudinaryImageStorage(),
     )
 
     video = models.FileField(
         upload_to="social/videos/",
         blank=True,
         null=True,
+        storage=CloudinaryVideoStorage(),
     )
 
     product = models.ForeignKey(

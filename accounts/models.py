@@ -1,3 +1,4 @@
+from config.cloudinary_storages import CloudinaryImageStorage, CloudinaryVideoStorage
 from django.contrib.auth.models import AbstractUser
 from django.db import models
 
@@ -28,6 +29,7 @@ class User(AbstractUser):
         upload_to="profiles/",
         blank=True,
         null=True,
+        storage=CloudinaryImageStorage(),
     )
 
     def __str__(self):

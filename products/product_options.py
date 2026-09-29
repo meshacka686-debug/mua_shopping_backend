@@ -1,3 +1,4 @@
+from config.cloudinary_storages import CloudinaryImageStorage, CloudinaryVideoStorage
 from django.db import models
 from django.db.models import Q
 
@@ -28,6 +29,7 @@ class ProductImage(models.Model):
 
     image = models.ImageField(
         upload_to="products/gallery/",
+        storage=CloudinaryImageStorage(),
     )
 
     size = models.CharField(
@@ -201,6 +203,7 @@ class ProductVariant(models.Model):
         upload_to="products/variants/",
         blank=True,
         null=True,
+        storage=CloudinaryImageStorage(),
     )
 
     is_available = models.BooleanField(

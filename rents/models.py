@@ -1,3 +1,4 @@
+from config.cloudinary_storages import CloudinaryImageStorage, CloudinaryVideoStorage
 from decimal import Decimal
 
 from django.conf import settings
@@ -54,12 +55,14 @@ class Rent(models.Model):
         upload_to="rents/images/",
         blank=True,
         null=True,
+        storage=CloudinaryImageStorage(),
     )
 
     video = models.FileField(
         upload_to="rents/videos/",
         blank=True,
         null=True,
+        storage=CloudinaryVideoStorage(),
     )
 
     is_available = models.BooleanField(
@@ -87,6 +90,7 @@ class RentImage(models.Model):
 
     image = models.ImageField(
         upload_to="rents/images/",
+        storage=CloudinaryImageStorage(),
     )
 
     created_at = models.DateTimeField(

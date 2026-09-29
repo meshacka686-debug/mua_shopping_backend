@@ -1,3 +1,4 @@
+from config.cloudinary_storages import CloudinaryImageStorage, CloudinaryVideoStorage
 from django.conf import settings
 from django.db import models
 
@@ -19,6 +20,7 @@ class Shop(models.Model):
         upload_to="shops/logos/",
         blank=True,
         null=True,
+        storage=CloudinaryImageStorage(),
     )
 
     is_active = models.BooleanField(default=True)

@@ -1,3 +1,4 @@
+from config.cloudinary_storages import CloudinaryImageStorage, CloudinaryVideoStorage
 from django.conf import settings
 from django.db import models
 
@@ -36,6 +37,7 @@ class Message(models.Model):
         upload_to="messaging/voice_notes/",
         blank=True,
         null=True,
+        storage=CloudinaryVideoStorage(),
     )
     voice_note_duration_ms = models.PositiveIntegerField(
         default=0,
@@ -45,11 +47,13 @@ class Message(models.Model):
         upload_to="messaging/images/",
         blank=True,
         null=True,
+        storage=CloudinaryImageStorage(),
     )
     video = models.FileField(
         upload_to="messaging/videos/",
         blank=True,
         null=True,
+        storage=CloudinaryVideoStorage(),
     )
     created_at = models.DateTimeField(auto_now_add=True)
     is_read = models.BooleanField(default=False)
