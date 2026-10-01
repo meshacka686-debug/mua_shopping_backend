@@ -30,11 +30,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv("DEBUG", "True").lower() == "true"
+DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 ALLOWED_HOSTS = [
-    "127.0.0.1",
-    "localhost",
-    "192.168.126.247",
+    '127.0.0.1',
+    'localhost',
+    '192.168.7.66',
 ]
 
 # Render automatically provides this hostname in production.
@@ -62,23 +62,24 @@ INSTALLED_APPS = [
 
     'rest_framework',
     'rest_framework.authtoken',
-'corsheaders',
-'accounts',
-'shops',
-'products',
-'orders',
-'payments',
-'rents',
-"admin_api",
-    "social",
-    "messaging",
+    'corsheaders',
+
+    'accounts',
+    'shops',
+    'products',
+    'orders',
+    'payments',
+    'admin_api',
+    'social',
+    'messaging',
+    'rents',
 ]
 
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -98,7 +99,7 @@ TEMPLATES = [
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
-            ],
+            ]
         },
     },
 ]
